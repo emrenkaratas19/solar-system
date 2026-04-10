@@ -6,6 +6,11 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		DAC810C22F87E12F00DF3A2C /* OpenGL.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = DAC810C12F87E12F00DF3A2C /* OpenGL.framework */; };
+		DAC810C42F87E28700DF3A2C /* libglfw.3.4.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = DAC810C32F87E28700DF3A2C /* libglfw.3.4.dylib */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXCopyFilesBuildPhase section */
 		DAC810B42F87DFF000DF3A2C /* CopyFiles */ = {
 			isa = PBXCopyFilesBuildPhase;
@@ -20,12 +25,19 @@
 
 /* Begin PBXFileReference section */
 		DAC810B62F87DFF000DF3A2C /* compgraphics */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = compgraphics; sourceTree = BUILT_PRODUCTS_DIR; };
+		DAC810C12F87E12F00DF3A2C /* OpenGL.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = OpenGL.framework; path = System/Library/Frameworks/OpenGL.framework; sourceTree = SDKROOT; };
+		DAC810C32F87E28700DF3A2C /* libglfw.3.4.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libglfw.3.4.dylib; path = ../../../../opt/homebrew/Cellar/glfw/3.4/lib/libglfw.3.4.dylib; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		DAC810B82F87DFF000DF3A2C /* compgraphics */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = compgraphics;
+			sourceTree = "<group>";
+		};
+		DAC810C82F88162700DF3A2C /* shaders */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = shaders;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -35,6 +47,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				DAC810C42F87E28700DF3A2C /* libglfw.3.4.dylib in Frameworks */,
+				DAC810C22F87E12F00DF3A2C /* OpenGL.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -44,7 +58,9 @@
 		DAC810AD2F87DFF000DF3A2C = {
 			isa = PBXGroup;
 			children = (
+				DAC810C82F88162700DF3A2C /* shaders */,
 				DAC810B82F87DFF000DF3A2C /* compgraphics */,
+				DAC810C02F87E12F00DF3A2C /* Frameworks */,
 				DAC810B72F87DFF000DF3A2C /* Products */,
 			);
 			sourceTree = "<group>";
@@ -55,6 +71,15 @@
 				DAC810B62F87DFF000DF3A2C /* compgraphics */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		DAC810C02F87E12F00DF3A2C /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				DAC810C32F87E28700DF3A2C /* libglfw.3.4.dylib */,
+				DAC810C12F87E12F00DF3A2C /* OpenGL.framework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -74,6 +99,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				DAC810B82F87DFF000DF3A2C /* compgraphics */,
+				DAC810C82F88162700DF3A2C /* shaders */,
 			);
 			name = compgraphics;
 			packageProductDependencies = (
@@ -245,6 +271,15 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
+				GCC_WARN_INHIBIT_ALL_WARNINGS = YES;
+				HEADER_SEARCH_PATHS = (
+					/opt/homebrew/opt/glfw/include,
+					/Users/macemo/Downloads/utilities/include,
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					/opt/homebrew/Cellar/glfw/3.4/lib,
+				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};
 			name = Debug;
@@ -253,6 +288,15 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
+				GCC_WARN_INHIBIT_ALL_WARNINGS = YES;
+				HEADER_SEARCH_PATHS = (
+					/opt/homebrew/opt/glfw/include,
+					/Users/macemo/Downloads/utilities/include,
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					/opt/homebrew/Cellar/glfw/3.4/lib,
+				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};
 			name = Release;
