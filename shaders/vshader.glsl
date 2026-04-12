@@ -19,10 +19,11 @@ out vec2 fragTexCoord;
 
 void main()
 {
-    vec4 worldPos   = model * vec4(vPosition, 1.0);
-    fragPos         = worldPos.xyz;
-    // For uniform-scale models, mat3(model) is sufficient after normalization
-    fragNormal      = normalize(mat3(model) * vNormal);
-    fragTexCoord    = vTexCoord;
-    gl_Position     = proj * view * worldPos;
+    vec4 worldPos = model * vec4(vPosition, 1.0);
+    fragPos = worldPos.xyz;
+
+    fragNormal = mat3(transpose(inverse(model))) * vNormal;
+    fragTexCoord = vTexCoord;
+
+    gl_Position = proj * view * worldPos;
 }
