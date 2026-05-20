@@ -1,0 +1,22 @@
+# macOS junk
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Xcode build / user data
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcuserdatad/
+*.swp
+
+# Xcode project user-specific bits (keep .pbxproj — shared)
+*.xcworkspace/xcuserdata/
+project.xcworkspace/xcuserdata/
+
+# Compiled binary
+*.o
+*.out
+*.dSYM/
