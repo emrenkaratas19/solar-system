@@ -14,6 +14,9 @@ uniform vec3  lightPos;
 uniform vec3  viewPos;
 uniform vec3  lightColor;
 uniform bool  isEmissive;
+uniform float ambientStrength;
+uniform float specularStrength;
+uniform float shininess;
 
 uniform bool  useSolidColor;
 uniform vec3  solidColor;
@@ -45,11 +48,16 @@ void main()
     vec3 viewDir  = normalize(viewPos  - fragPos);
     vec3 reflDir  = reflect(-lightDir, norm);
 
-    float ambient = 0.12;
+    float ambient = ambientStrength;
     float diff    = max(dot(norm, lightDir), 0.0);
-    float spec    = pow(max(dot(reflDir, viewDir), 0.0), 32.0) * 0.5;
+    float spec    = 0.0;
+    if (diff > 0.0) {
+        spec = pow(max(dot(reflDir, viewDir), 0.0), shininess) * specularStrength;
+    }
 
-    vec3 result = (ambient + diff + spec) * lightColor * texSample.rgb;
+    vec3 diffuse = (ambient + diff) * lightColor * texSample.rgb;
+    vec3 specular = spec * lightColor;
+    vec3 result = diffuse + specular;
 
     // Bright cyan rim halo when this body is the selected one — visible even on tiny moons.
     if (highlight > 0.5) {

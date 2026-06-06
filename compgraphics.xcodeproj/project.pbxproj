@@ -40,6 +40,11 @@
 			path = shaders;
 			sourceTree = "<group>";
 		};
+		DAEFC6AD2FD4CE0A00697633 /* textures */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = textures;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -58,6 +63,7 @@
 		DAC810AD2F87DFF000DF3A2C = {
 			isa = PBXGroup;
 			children = (
+				DAEFC6AD2FD4CE0A00697633 /* textures */,
 				DAC810C82F88162700DF3A2C /* shaders */,
 				DAC810B82F87DFF000DF3A2C /* compgraphics */,
 				DAC810C02F87E12F00DF3A2C /* Frameworks */,
@@ -100,6 +106,7 @@
 			fileSystemSynchronizedGroups = (
 				DAC810B82F87DFF000DF3A2C /* compgraphics */,
 				DAC810C82F88162700DF3A2C /* shaders */,
+				DAEFC6AD2FD4CE0A00697633 /* textures */,
 			);
 			name = compgraphics;
 			packageProductDependencies = (

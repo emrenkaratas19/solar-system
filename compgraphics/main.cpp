@@ -39,6 +39,13 @@
 static void updateWindowTitle(GLFWwindow* window);
 static void buildOrbitCircle(std::vector<float>& verts, int segments = 200);
 static void drawTextOverlay(GLFWwindow* window, const mat4& view, const mat4& proj);
+static void drawSkybox(const mat4& view, const mat4& proj);
+static void drawFlightSprite(GLFWwindow* window, const mat4& ortho);
+static void drawSunGlow(const mat4& view, const mat4& proj);
+static void drawEarthAtmosphere(const mat4& earthModel, const mat4& view, const mat4& proj);
+static void drawTurkeyMarker(const mat4& earthOrbitTF, float earthSpinAngle);
+static void enterEarthMode(GLFWwindow* window);
+static void displayEarthScene(GLFWwindow* window, float realDt);
 static void displayGravityScene(GLFWwindow* window, float realDt);
 
 // ── Sphere geometry ──────────────────────────────────────────────────────────
@@ -155,6 +162,117 @@ static GLuint loadTex(const char* path, const unsigned char fallbackRGBA[4])
     return tex;
 }
 
+static vec3 cubemapFaceDirection(int face, float s, float t) {
+    switch (face) {
+        case 0: return normalize(vec3( 1.0f, -t,    -s));    // +X
+        case 1: return normalize(vec3(-1.0f, -t,     s));    // -X
+        case 2: return normalize(vec3( s,     1.0f,  t));    // +Y
+        case 3: return normalize(vec3( s,    -1.0f, -t));    // -Y
+        case 4: return normalize(vec3( s,    -t,     1.0f)); // +Z
+        default:return normalize(vec3(-s,    -t,    -1.0f)); // -Z
+    }
+}
+
+static void sampleEquirectangular(const unsigned char* src, int w, int h,
+                                  const vec3& dir, unsigned char out[4]) {
+    float lon = atan2f(dir.z, dir.x);
+    float lat = asinf(std::max(-1.0f, std::min(1.0f, dir.y)));
+
+    float u = lon / (2.0f * (float)M_PI) + 0.5f;
+    float v = 0.5f - lat / (float)M_PI;
+
+    u = u - floorf(u);
+    v = std::max(0.0f, std::min(1.0f, v));
+
+    float x = u * (float)(w - 1);
+    float y = v * (float)(h - 1);
+    int x0 = (int)floorf(x);
+    int y0 = (int)floorf(y);
+    int x1 = (x0 + 1) % w;
+    int y1 = std::min(y0 + 1, h - 1);
+    float tx = x - (float)x0;
+    float ty = y - (float)y0;
+
+    const unsigned char* p00 = src + (y0 * w + x0) * 4;
+    const unsigned char* p10 = src + (y0 * w + x1) * 4;
+    const unsigned char* p01 = src + (y1 * w + x0) * 4;
+    const unsigned char* p11 = src + (y1 * w + x1) * 4;
+
+    for (int c = 0; c < 4; ++c) {
+        float a = p00[c] * (1.0f - tx) + p10[c] * tx;
+        float b = p01[c] * (1.0f - tx) + p11[c] * tx;
+        out[c] = (unsigned char)(a * (1.0f - ty) + b * ty + 0.5f);
+    }
+}
+
+static GLuint loadSkyboxCubemap(const char* panoramaPath) {
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, tex);
+
+#ifdef HAVE_STB_IMAGE
+    stbi_set_flip_vertically_on_load(false);
+    std::string resolved = findTexture(panoramaPath);
+    int w = 0, h = 0, ch = 0;
+    unsigned char* panorama = nullptr;
+    if (!resolved.empty()) {
+        panorama = stbi_load(resolved.c_str(), &w, &h, &ch, 4);
+    }
+
+    if (panorama) {
+        int faceSize = std::max(256, std::min(1024, w / 4));
+        std::vector<unsigned char> facePixels(faceSize * faceSize * 4);
+
+        for (int face = 0; face < 6; ++face) {
+            for (int y = 0; y < faceSize; ++y) {
+                for (int x = 0; x < faceSize; ++x) {
+                    float s = (2.0f * ((float)x + 0.5f) / (float)faceSize) - 1.0f;
+                    float t = (2.0f * ((float)y + 0.5f) / (float)faceSize) - 1.0f;
+                    vec3 dir = cubemapFaceDirection(face, s, t);
+                    sampleEquirectangular(panorama, w, h, dir,
+                                          &facePixels[(y * faceSize + x) * 4]);
+                }
+            }
+
+            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_RGBA,
+                         faceSize, faceSize, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                         facePixels.data());
+        }
+
+        glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+        stbi_image_free(panorama);
+        std::cout << "[skybox OK] " << resolved << " -> 6 faces ("
+                  << faceSize << "x" << faceSize << ")\n";
+    } else {
+        if (resolved.empty()) {
+            std::cerr << "[skybox MISS] " << panoramaPath << "  (no file found via any path)\n";
+        } else {
+            std::cerr << "[skybox FAIL] " << resolved << "  (stb_image: "
+                      << stbi_failure_reason() << ")\n";
+        }
+        const unsigned char fallback[] = { 2, 3, 10, 255 };
+        for (int face = 0; face < 6; ++face) {
+            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_RGBA,
+                         1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, fallback);
+        }
+    }
+#else
+    const unsigned char fallback[] = { 2, 3, 10, 255 };
+    for (int face = 0; face < 6; ++face) {
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_RGBA,
+                     1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, fallback);
+    }
+#endif
+
+    glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    return tex;
+}
+
 // ── Planet data ──────────────────────────────────────────────────────────────
 
 struct Planet {
@@ -213,16 +331,38 @@ static GLuint program;
 static unsigned int sphereIndexCount;
 static unsigned int orbitVertexCount;
 
+static GLuint skyboxVAO = 0, skyboxVBO = 0;
+static GLuint skyboxProgram = 0;
+static GLuint skyboxCubemap = 0;
+static GLint  uSkyboxView = -1, uSkyboxProj = -1, uSkyboxTex = -1;
+
 static GLint uModel, uView, uProj;
 static GLint uLightPos, uViewPos, uLightColor;
 static GLint uIsEmissive, uTex;
 static GLint uUseSolidColor, uSolidColor;
 static GLint uHighlight;
+static GLint uAmbientStrength, uSpecularStrength, uShininess;
+
+// additive visual effects
+static GLuint glowProgram = 0;
+static GLuint glowVAO = 0, glowVBO = 0;
+static GLint  uGlowView = -1, uGlowProj = -1, uGlowColor = -1, uGlowAlpha = -1;
+
+static GLuint atmosphereProgram = 0;
+static GLuint atmosphereVAO = 0;
+static GLint  uAtmModel = -1, uAtmView = -1, uAtmProj = -1, uAtmViewPos = -1;
+static GLint  uAtmColor = -1, uAtmStrength = -1;
 
 // text overlay GL objects
 static GLuint textProgram = 0;
 static GLuint textVAO = 0, textVBO = 0, textEBO = 0;
 static GLint  uTextProj = -1, uTextColor = -1;
+
+// free-flight overlay sprite
+static GLuint flightProgram = 0;
+static GLuint flightVAO = 0, flightVBO = 0;
+static GLuint flightTex = 0;
+static GLint  uFlightProj = -1, uFlightTex = -1, uFlightAlpha = -1;
 
 // selection marker (2D ring drawn at the projected position of the selected body)
 static GLuint markerVAO = 0, markerVBO = 0;
@@ -242,7 +382,13 @@ static vec3  camFront(0.0f, 0.0f, -1.0f);
 static vec3  camUp(0.0f, 1.0f, 0.0f);
 static float camYaw    = defaultYaw;
 static float camPitch  = defaultPitch;
-static float camSpeed  = 8.0f;
+static float camSpeed  = 3.0f;
+static vec3  flyVelocity(0.0f, 0.0f, 0.0f);
+static bool  isFlying = false;
+static float currentFlySpeed = 0.0f;
+static float earthApproachAltitude = 999.0f;
+static vec3  turkeyWorldPos(0.0f, 0.0f, 0.0f);
+static bool  turkeyMarkerVisible = false;
 
 static int   winWidth = 1280, winHeight = 800;
 static float lastMouseX = 640.0f, lastMouseY = 400.0f;
@@ -257,8 +403,12 @@ static float focusFollowDistance = 0.0f;
 
 // ── Scene mode (solar system vs gravity simulator) ───────────────────────────
 
-enum SceneMode { SCENE_SOLAR = 0, SCENE_GRAVITY = 1 };
+enum SceneMode { SCENE_SOLAR = 0, SCENE_GRAVITY = 1, SCENE_EARTH = 2 };
 static SceneMode sceneMode = SCENE_SOLAR;
+
+static const float EARTH_MODE_RADIUS = 5.0f;
+static const float EARTH_MODE_MIN_ALTITUDE = 0.18f;
+static const float EARTH_MODE_MAX_ALTITUDE = 8.0f;
 
 // Gravity-sim state. When entering SCENE_GRAVITY we snapshot the
 // selected planet's gravity and name so changing the selection
@@ -306,6 +456,125 @@ static void updateAnglesFromCamFront() {
     camYaw   = atan2f(camFront.z, camFront.x) * 180.0f / (float)M_PI;
 }
 
+static void setPlanetMaterial(int planetIndex) {
+    float ambient = 0.035f;
+    float specular = 0.12f;
+    float shine = 24.0f;
+
+    if (planetIndex == 3) {              // Earth: water/ocean glints
+        specular = 0.95f;
+        shine = 72.0f;
+    } else if (planetIndex == 2 || planetIndex == 8 ||
+               planetIndex == 12 || planetIndex == 14 || planetIndex == 15) {
+        specular = 0.22f;                // cloudy/gas/ice planets
+        shine = 36.0f;
+    } else if (planetIndex == 0) {
+        ambient = 1.0f;
+        specular = 0.0f;
+        shine = 1.0f;
+    }
+
+    glUniform1f(uAmbientStrength, ambient);
+    glUniform1f(uSpecularStrength, specular);
+    glUniform1f(uShininess, shine);
+}
+
+static vec3 earthSurfaceDirection(float latitudeDeg, float longitudeDeg) {
+    float lat = latitudeDeg * (float)M_PI / 180.0f;
+    float lon = longitudeDeg * (float)M_PI / 180.0f;
+    float cosLat = cosf(lat);
+    return normalize(vec3(cosLat * cosf(lon), sinf(lat), cosLat * sinf(lon)));
+}
+
+static vec3 transformPoint(const mat4& m, const vec3& p) {
+    return vec3(
+        m[0][0] * p.x + m[0][1] * p.y + m[0][2] * p.z + m[0][3],
+        m[1][0] * p.x + m[1][1] * p.y + m[1][2] * p.z + m[1][3],
+        m[2][0] * p.x + m[2][1] * p.y + m[2][2] * p.z + m[2][3]
+    );
+}
+
+static float earthAwareFlySpeed() {
+    const Planet& earth = planets[3];
+    vec3 toEarth = camPos - earth.worldPos;
+    float distanceToEarth = length(toEarth);
+    earthApproachAltitude = std::max(0.0f, distanceToEarth - earth.scale);
+
+    float t = (earthApproachAltitude - 0.05f) / 3.0f;
+    t = std::max(0.0f, std::min(1.0f, t));
+    float smooth = t * t * (3.0f - 2.0f * t);
+
+    float closeSpeed = 0.16f;
+    return closeSpeed + (camSpeed - closeSpeed) * smooth;
+}
+
+static void keepCameraAboveEarthSurface() {
+    const Planet& earth = planets[3];
+    vec3 fromEarth = camPos - earth.worldPos;
+    float distanceToEarth = length(fromEarth);
+    float minimumDistance = earth.scale * 1.04f;
+    if (distanceToEarth > 0.0001f && distanceToEarth < minimumDistance) {
+        vec3 outward = fromEarth * (1.0f / distanceToEarth);
+        camPos = earth.worldPos + outward * minimumDistance;
+        float outwardSpeed = dot(flyVelocity, outward);
+        if (outwardSpeed < 0.0f) {
+            flyVelocity = flyVelocity - outward * outwardSpeed;
+        }
+    }
+}
+
+static float earthModeAltitude() {
+    return std::max(0.0f, length(camPos) - EARTH_MODE_RADIUS);
+}
+
+static float earthModeFlySpeed(float altitude) {
+    float t = altitude / EARTH_MODE_MAX_ALTITUDE;
+    t = std::max(0.0f, std::min(1.0f, t));
+    float smooth = t * t * (3.0f - 2.0f * t);
+    return 0.12f + 1.85f * smooth;
+}
+
+static void keepEarthModeCameraInFlightBand() {
+    float distanceFromCenter = length(camPos);
+    if (distanceFromCenter <= 0.0001f) {
+        camPos = earthSurfaceDirection(39.0f, 35.0f) * (EARTH_MODE_RADIUS + 2.0f);
+        return;
+    }
+
+    vec3 outward = camPos * (1.0f / distanceFromCenter);
+    float minDistance = EARTH_MODE_RADIUS + EARTH_MODE_MIN_ALTITUDE;
+    float maxDistance = EARTH_MODE_RADIUS + EARTH_MODE_MAX_ALTITUDE;
+    if (distanceFromCenter < minDistance) {
+        camPos = outward * minDistance;
+        float inwardSpeed = dot(flyVelocity, outward);
+        if (inwardSpeed < 0.0f) flyVelocity = flyVelocity - outward * inwardSpeed;
+    } else if (distanceFromCenter > maxDistance) {
+        camPos = outward * maxDistance;
+        float outwardSpeed = dot(flyVelocity, outward);
+        if (outwardSpeed > 0.0f) flyVelocity = flyVelocity - outward * outwardSpeed;
+    }
+}
+
+static void enterEarthMode(GLFWwindow* window) {
+    sceneMode = SCENE_EARTH;
+    focusedPlanet = -1;
+    selectedPlanet = 3;
+    paused = false;
+    flyVelocity = vec3(0.0f, 0.0f, 0.0f);
+    isFlying = false;
+
+    vec3 turkeyDir = earthSurfaceDirection(39.0f, 35.0f);
+    camPos = turkeyDir * (EARTH_MODE_RADIUS + 4.2f);
+    camFront = normalize(-turkeyDir);
+    updateAnglesFromCamFront();
+
+    mouseCaptured = true;
+    firstMouse = true;
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    updateWindowTitle(window);
+    std::cout << "Entered Earth travel mode. Fly toward the Turkey marker.\n";
+}
+
 static void updateWindowTitle(GLFWwindow* window) {
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(1);
@@ -314,8 +583,10 @@ static void updateWindowTitle(GLFWwindow* window) {
             << "  g = " << gravG << " m/s^2"
             << "  drop = " << gravStartY << " m"
             << "  |  Space:drop  R:reset  Up/Down:height  G:exit  ESC:quit";
+    } else if (sceneMode == SCENE_EARTH) {
+        oss << "Earth Travel Mode  |  WASD:fly  Mouse:look  R:reset above Turkey  E:exit  ESC:quit";
     } else {
-        oss << "Solar System  |  M:Mouse  WASD:Move  Click:Select  F:Focus  G:Gravity  Space:Pause  Up/Down:Speed  R:Reset  ESC:Quit  |  ";
+        oss << "Solar System  |  E:Earth Mode  M:Mouse  WASD:Move  Click:Select  F:Focus  G:Gravity  Space:Pause  Up/Down:Speed  R:Reset  ESC:Quit  |  ";
         if (paused) oss << "Paused";
         else        oss << "Speed " << timeScale << "x";
         if (selectedPlanet >= 0) oss << "  |  Selected: " << planets[selectedPlanet].name;
@@ -325,6 +596,7 @@ static void updateWindowTitle(GLFWwindow* window) {
 }
 
 static void resetToDefaults(GLFWwindow* window) {
+    sceneMode = SCENE_SOLAR;
     timeScale = 1.0f;
     paused = false;
     camPos = defaultCamPos;
@@ -333,6 +605,8 @@ static void resetToDefaults(GLFWwindow* window) {
     updateCamFrontFromAngles();
     selectedPlanet = -1;
     focusedPlanet  = -1;
+    flyVelocity = vec3(0.0f, 0.0f, 0.0f);
+    isFlying = false;
     mouseCaptured = false;
     firstMouse = true;
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
@@ -411,6 +685,42 @@ static void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
         glfwSetWindowShouldClose(window, GLFW_TRUE);
 
+    if (key == GLFW_KEY_E && action == GLFW_PRESS) {
+        if (sceneMode == SCENE_EARTH) {
+            sceneMode = SCENE_SOLAR;
+            camPos = defaultCamPos;
+            camYaw = defaultYaw;
+            camPitch = defaultPitch;
+            updateCamFrontFromAngles();
+            flyVelocity = vec3(0.0f, 0.0f, 0.0f);
+            isFlying = false;
+            mouseCaptured = false;
+            firstMouse = true;
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+            updateWindowTitle(window);
+            std::cout << "Exited Earth travel mode\n";
+        } else if (sceneMode == SCENE_SOLAR) {
+            enterEarthMode(window);
+        }
+        return;
+    }
+
+    if (sceneMode == SCENE_EARTH) {
+        if (action != GLFW_PRESS) return;
+        if (key == GLFW_KEY_R) {
+            enterEarthMode(window);
+        } else if (key == GLFW_KEY_M) {
+            mouseCaptured = !mouseCaptured;
+            glfwSetInputMode(window, GLFW_CURSOR,
+                             mouseCaptured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+            firstMouse = true;
+            flyVelocity = vec3(0.0f, 0.0f, 0.0f);
+            isFlying = false;
+            updateWindowTitle(window);
+        }
+        return;
+    }
+
     // G toggles gravity sim mode (universal — works from either scene)
     if (key == GLFW_KEY_G && action == GLFW_PRESS) {
         if (sceneMode == SCENE_GRAVITY) {
@@ -466,6 +776,8 @@ static void keyCallback(GLFWwindow* window, int key, int, int action, int) {
         } else {
             glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
         }
+        flyVelocity = vec3(0.0f, 0.0f, 0.0f);
+        isFlying = false;
         updateWindowTitle(window);
     }
 
@@ -474,9 +786,13 @@ static void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     if (key == GLFW_KEY_F && action == GLFW_PRESS) {
         if (focusedPlanet >= 0) {
             focusedPlanet = -1;
+            flyVelocity = vec3(0.0f, 0.0f, 0.0f);
+            isFlying = false;
             std::cout << "Focus released\n";
         } else if (selectedPlanet >= 0) {
             focusedPlanet = selectedPlanet;
+            flyVelocity = vec3(0.0f, 0.0f, 0.0f);
+            isFlying = false;
             // Distance proportional to body radius, with a sensible minimum.
             float r = planets[focusedPlanet].scale;
             focusFollowDistance = std::max(r * 5.0f, 0.7f);
@@ -630,6 +946,389 @@ static void initTextRendering() {
     glBindVertexArray(0);
 }
 
+static void initFlightSpriteRendering() {
+    const char* vs =
+        "#version 150\n"
+        "in vec2 inPos;\n"
+        "in vec2 inTexCoord;\n"
+        "uniform mat4 uProj;\n"
+        "out vec2 texCoord;\n"
+        "void main() {\n"
+        "    texCoord = inTexCoord;\n"
+        "    gl_Position = uProj * vec4(inPos, 0.0, 1.0);\n"
+        "}\n";
+    const char* fs =
+        "#version 150\n"
+        "in vec2 texCoord;\n"
+        "uniform sampler2D uTex;\n"
+        "uniform float uAlpha;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    vec4 c = texture(uTex, texCoord);\n"
+        "    fragColor = vec4(c.rgb, c.a * uAlpha);\n"
+        "}\n";
+
+    GLuint v = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(v, 1, &vs, nullptr); glCompileShader(v);
+    GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(f, 1, &fs, nullptr); glCompileShader(f);
+
+    flightProgram = glCreateProgram();
+    glAttachShader(flightProgram, v);
+    glAttachShader(flightProgram, f);
+    glBindAttribLocation(flightProgram, 0, "inPos");
+    glBindAttribLocation(flightProgram, 1, "inTexCoord");
+    glLinkProgram(flightProgram);
+    glDeleteShader(v); glDeleteShader(f);
+
+    uFlightProj  = glGetUniformLocation(flightProgram, "uProj");
+    uFlightTex   = glGetUniformLocation(flightProgram, "uTex");
+    uFlightAlpha = glGetUniformLocation(flightProgram, "uAlpha");
+
+    glGenVertexArrays(1, &flightVAO);
+    glBindVertexArray(flightVAO);
+
+    glGenBuffers(1, &flightVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, flightVBO);
+
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+
+    const unsigned char fallback[] = { 80, 120, 255, 255 };
+    flightTex = loadTex("textures/flying_sprite.png", fallback);
+
+    glBindVertexArray(0);
+}
+
+static void drawFlightSprite(GLFWwindow* window, const mat4& ortho) {
+    if (!isFlying || !flightProgram || !flightVAO || !flightTex) return;
+
+    int wsW, wsH;
+    glfwGetWindowSize(window, &wsW, &wsH);
+    if (wsW <= 0 || wsH <= 0) return;
+
+    float size = std::min(180.0f, std::max(110.0f, std::min((float)wsW, (float)wsH) * 0.18f));
+    float centerX = (float)wsW * 0.5f;
+    float centerY = (float)wsH * 0.74f;
+    float x0 = centerX - size * 0.5f;
+    float y0 = centerY - size * 0.5f;
+    float x1 = x0 + size;
+    float y1 = y0 + size;
+
+    float verts[] = {
+        x0, y0, 0.0f, 1.0f,
+        x1, y0, 1.0f, 1.0f,
+        x0, y1, 0.0f, 0.0f,
+        x1, y0, 1.0f, 1.0f,
+        x1, y1, 1.0f, 0.0f,
+        x0, y1, 0.0f, 0.0f,
+    };
+
+    float speedSq = dot(flyVelocity, flyVelocity);
+    float alpha = std::min(0.72f, 0.24f + speedSq * 0.06f);
+
+    glUseProgram(flightProgram);
+    glUniformMatrix4fv(uFlightProj, 1, GL_TRUE, ortho);
+    glUniform1i(uFlightTex, 0);
+    glUniform1f(uFlightAlpha, alpha);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, flightTex);
+    glBindVertexArray(flightVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, flightVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindVertexArray(0);
+}
+
+static void initSkybox() {
+    const float cubeVerts[] = {
+        -1.0f,  1.0f, -1.0f,  -1.0f, -1.0f, -1.0f,   1.0f, -1.0f, -1.0f,
+         1.0f, -1.0f, -1.0f,   1.0f,  1.0f, -1.0f,  -1.0f,  1.0f, -1.0f,
+
+        -1.0f, -1.0f,  1.0f,  -1.0f, -1.0f, -1.0f,  -1.0f,  1.0f, -1.0f,
+        -1.0f,  1.0f, -1.0f,  -1.0f,  1.0f,  1.0f,  -1.0f, -1.0f,  1.0f,
+
+         1.0f, -1.0f, -1.0f,   1.0f, -1.0f,  1.0f,   1.0f,  1.0f,  1.0f,
+         1.0f,  1.0f,  1.0f,   1.0f,  1.0f, -1.0f,   1.0f, -1.0f, -1.0f,
+
+        -1.0f, -1.0f,  1.0f,  -1.0f,  1.0f,  1.0f,   1.0f,  1.0f,  1.0f,
+         1.0f,  1.0f,  1.0f,   1.0f, -1.0f,  1.0f,  -1.0f, -1.0f,  1.0f,
+
+        -1.0f,  1.0f, -1.0f,   1.0f,  1.0f, -1.0f,   1.0f,  1.0f,  1.0f,
+         1.0f,  1.0f,  1.0f,  -1.0f,  1.0f,  1.0f,  -1.0f,  1.0f, -1.0f,
+
+        -1.0f, -1.0f, -1.0f,  -1.0f, -1.0f,  1.0f,   1.0f, -1.0f, -1.0f,
+         1.0f, -1.0f, -1.0f,  -1.0f, -1.0f,  1.0f,   1.0f, -1.0f,  1.0f
+    };
+
+    skyboxProgram = Angel::InitShader("shaders/skybox_vshader.glsl",
+                                      "shaders/skybox_fshader.glsl");
+
+    glGenVertexArrays(1, &skyboxVAO);
+    glBindVertexArray(skyboxVAO);
+
+    glGenBuffers(1, &skyboxVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, skyboxVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(cubeVerts), cubeVerts, GL_STATIC_DRAW);
+
+    GLuint posLoc = glGetAttribLocation(skyboxProgram, "vPosition");
+    glEnableVertexAttribArray(posLoc);
+    glVertexAttribPointer(posLoc, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+
+    uSkyboxView = glGetUniformLocation(skyboxProgram, "view");
+    uSkyboxProj = glGetUniformLocation(skyboxProgram, "proj");
+    uSkyboxTex  = glGetUniformLocation(skyboxProgram, "uSkybox");
+
+    skyboxCubemap = loadSkyboxCubemap("textures/starmap_random_2020_4k.jpg");
+
+    glBindVertexArray(0);
+}
+
+static void drawSkybox(const mat4& view, const mat4& proj) {
+    if (!skyboxProgram || !skyboxVAO || !skyboxCubemap) return;
+
+    mat4 skyView = view;
+    skyView[0][3] = 0.0f;
+    skyView[1][3] = 0.0f;
+    skyView[2][3] = 0.0f;
+
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_FALSE);
+
+    glUseProgram(skyboxProgram);
+    glUniformMatrix4fv(uSkyboxView, 1, GL_TRUE, skyView);
+    glUniformMatrix4fv(uSkyboxProj, 1, GL_TRUE, proj);
+    glUniform1i(uSkyboxTex, 0);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, skyboxCubemap);
+    glBindVertexArray(skyboxVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 36);
+    glBindVertexArray(0);
+
+    glDepthMask(GL_TRUE);
+    glDepthFunc(GL_LESS);
+}
+
+static void initLightingEffects(GLuint spherePosLoc, GLuint sphereNorLoc) {
+    const char* glowVS =
+        "#version 150\n"
+        "in vec3 inPos;\n"
+        "in vec2 inTexCoord;\n"
+        "uniform mat4 view;\n"
+        "uniform mat4 proj;\n"
+        "out vec2 texCoord;\n"
+        "void main() {\n"
+        "    texCoord = inTexCoord;\n"
+        "    gl_Position = proj * view * vec4(inPos, 1.0);\n"
+        "}\n";
+    const char* glowFS =
+        "#version 150\n"
+        "in vec2 texCoord;\n"
+        "uniform vec3 glowColor;\n"
+        "uniform float glowAlpha;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    float d = length(texCoord - vec2(0.5));\n"
+        "    float core = smoothstep(0.50, 0.0, d);\n"
+        "    float soft = pow(core, 1.8);\n"
+        "    fragColor = vec4(glowColor * (0.35 + soft), soft * glowAlpha);\n"
+        "}\n";
+
+    GLuint gv = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(gv, 1, &glowVS, nullptr); glCompileShader(gv);
+    GLuint gf = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(gf, 1, &glowFS, nullptr); glCompileShader(gf);
+
+    glowProgram = glCreateProgram();
+    glAttachShader(glowProgram, gv);
+    glAttachShader(glowProgram, gf);
+    glBindAttribLocation(glowProgram, 0, "inPos");
+    glBindAttribLocation(glowProgram, 1, "inTexCoord");
+    glLinkProgram(glowProgram);
+    glDeleteShader(gv); glDeleteShader(gf);
+
+    uGlowView  = glGetUniformLocation(glowProgram, "view");
+    uGlowProj  = glGetUniformLocation(glowProgram, "proj");
+    uGlowColor = glGetUniformLocation(glowProgram, "glowColor");
+    uGlowAlpha = glGetUniformLocation(glowProgram, "glowAlpha");
+
+    glGenVertexArrays(1, &glowVAO);
+    glBindVertexArray(glowVAO);
+    glGenBuffers(1, &glowVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, glowVBO);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+    glBindVertexArray(0);
+
+    const char* atmosphereVS =
+        "#version 150\n"
+        "in vec3 vPosition;\n"
+        "in vec3 vNormal;\n"
+        "uniform mat4 model;\n"
+        "uniform mat4 view;\n"
+        "uniform mat4 proj;\n"
+        "out vec3 worldPos;\n"
+        "out vec3 worldNormal;\n"
+        "void main() {\n"
+        "    vec4 wp = model * vec4(vPosition, 1.0);\n"
+        "    worldPos = wp.xyz;\n"
+        "    worldNormal = mat3(transpose(inverse(model))) * vNormal;\n"
+        "    gl_Position = proj * view * wp;\n"
+        "}\n";
+    const char* atmosphereFS =
+        "#version 150\n"
+        "in vec3 worldPos;\n"
+        "in vec3 worldNormal;\n"
+        "uniform vec3 viewPos;\n"
+        "uniform vec3 atmosphereColor;\n"
+        "uniform float atmosphereStrength;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    vec3 n = normalize(worldNormal);\n"
+        "    vec3 v = normalize(viewPos - worldPos);\n"
+        "    float rim = pow(1.0 - max(dot(n, v), 0.0), 2.1);\n"
+        "    float alpha = rim * atmosphereStrength;\n"
+        "    fragColor = vec4(atmosphereColor * (0.55 + rim * 1.6), alpha);\n"
+        "}\n";
+
+    GLuint av = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(av, 1, &atmosphereVS, nullptr); glCompileShader(av);
+    GLuint af = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(af, 1, &atmosphereFS, nullptr); glCompileShader(af);
+
+    atmosphereProgram = glCreateProgram();
+    glAttachShader(atmosphereProgram, av);
+    glAttachShader(atmosphereProgram, af);
+    glBindAttribLocation(atmosphereProgram, spherePosLoc, "vPosition");
+    glBindAttribLocation(atmosphereProgram, sphereNorLoc, "vNormal");
+    glLinkProgram(atmosphereProgram);
+    glDeleteShader(av); glDeleteShader(af);
+
+    uAtmModel    = glGetUniformLocation(atmosphereProgram, "model");
+    uAtmView     = glGetUniformLocation(atmosphereProgram, "view");
+    uAtmProj     = glGetUniformLocation(atmosphereProgram, "proj");
+    uAtmViewPos  = glGetUniformLocation(atmosphereProgram, "viewPos");
+    uAtmColor    = glGetUniformLocation(atmosphereProgram, "atmosphereColor");
+    uAtmStrength = glGetUniformLocation(atmosphereProgram, "atmosphereStrength");
+
+    glGenVertexArrays(1, &atmosphereVAO);
+    glBindVertexArray(atmosphereVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glEnableVertexAttribArray(spherePosLoc);
+    glVertexAttribPointer(spherePosLoc, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(sphereNorLoc);
+    glVertexAttribPointer(sphereNorLoc, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    glBindVertexArray(0);
+}
+
+static void drawSunGlow(const mat4& view, const mat4& proj) {
+    if (!glowProgram || !glowVAO) return;
+
+    vec3 center(0.0f, 0.0f, 0.0f);
+    vec3 right = normalize(cross(camFront, camUp));
+    vec3 up = normalize(cross(right, camFront));
+    float size = 5.4f;
+    vec3 r = right * size;
+    vec3 u = up * size;
+
+    vec3 p0 = center - r - u;
+    vec3 p1 = center + r - u;
+    vec3 p2 = center - r + u;
+    vec3 p3 = center + r + u;
+
+    float verts[] = {
+        p0.x, p0.y, p0.z, 0.0f, 0.0f,
+        p1.x, p1.y, p1.z, 1.0f, 0.0f,
+        p2.x, p2.y, p2.z, 0.0f, 1.0f,
+        p1.x, p1.y, p1.z, 1.0f, 0.0f,
+        p3.x, p3.y, p3.z, 1.0f, 1.0f,
+        p2.x, p2.y, p2.z, 0.0f, 1.0f,
+    };
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glDepthMask(GL_FALSE);
+
+    glUseProgram(glowProgram);
+    glUniformMatrix4fv(uGlowView, 1, GL_TRUE, view);
+    glUniformMatrix4fv(uGlowProj, 1, GL_TRUE, proj);
+    glUniform3f(uGlowColor, 1.0f, 0.62f, 0.16f);
+    glUniform1f(uGlowAlpha, 0.70f);
+
+    glBindVertexArray(glowVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, glowVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindVertexArray(0);
+
+    glDepthMask(GL_TRUE);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_BLEND);
+}
+
+static void drawEarthAtmosphere(const mat4& earthModel, const mat4& view, const mat4& proj) {
+    if (!atmosphereProgram || !atmosphereVAO) return;
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glDepthMask(GL_FALSE);
+
+    glUseProgram(atmosphereProgram);
+    glUniformMatrix4fv(uAtmModel, 1, GL_TRUE, earthModel);
+    glUniformMatrix4fv(uAtmView, 1, GL_TRUE, view);
+    glUniformMatrix4fv(uAtmProj, 1, GL_TRUE, proj);
+    glUniform3f(uAtmViewPos, camPos.x, camPos.y, camPos.z);
+    glUniform3f(uAtmColor, 0.30f, 0.70f, 1.0f);
+    glUniform1f(uAtmStrength, 0.36f);
+
+    glBindVertexArray(atmosphereVAO);
+    glDrawElements(GL_TRIANGLES, sphereIndexCount, GL_UNSIGNED_INT, nullptr);
+    glBindVertexArray(0);
+
+    glDepthMask(GL_TRUE);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_BLEND);
+}
+
+static void drawTurkeyMarkerAt(const mat4& earthBaseTF, float earthRadius, float markerScale) {
+    vec3 turkeyDir = earthSurfaceDirection(39.0f, 35.0f);
+
+    float surfaceRadius = earthRadius * 1.02f;
+    turkeyWorldPos = transformPoint(earthBaseTF, turkeyDir * surfaceRadius);
+    turkeyMarkerVisible = true;
+
+    mat4 markerModel = earthBaseTF
+                     * Translate(turkeyDir.x * surfaceRadius,
+                                 turkeyDir.y * surfaceRadius,
+                                 turkeyDir.z * surfaceRadius)
+                     * Scale(markerScale, markerScale, markerScale);
+
+    glUseProgram(program);
+    glUniform1i(uUseSolidColor, 1);
+    glUniform3f(uSolidColor, 1.0f, 0.86f, 0.22f);
+    glUniform1i(uIsEmissive, 1);
+    glUniform1f(uHighlight, 0.0f);
+    glUniformMatrix4fv(uModel, 1, GL_TRUE, markerModel);
+
+    glBindVertexArray(vao);
+    glDrawElements(GL_TRIANGLES, sphereIndexCount, GL_UNSIGNED_INT, nullptr);
+
+    glUniform1i(uUseSolidColor, 0);
+}
+
+static void drawTurkeyMarker(const mat4& earthOrbitTF, float earthSpinAngle) {
+    const Planet& earth = planets[3];
+    mat4 earthRot = earthOrbitTF * RotateZ(earth.axialTilt) * RotateY(earthSpinAngle);
+    drawTurkeyMarkerAt(earthRot, earth.scale, 0.018f);
+}
+
 static void init() {
     std::vector<float>        verts;
     std::vector<unsigned int> idx;
@@ -689,11 +1388,18 @@ static void init() {
     uUseSolidColor = glGetUniformLocation(program, "useSolidColor");
     uSolidColor    = glGetUniformLocation(program, "solidColor");
     uHighlight     = glGetUniformLocation(program, "highlight");
+    uAmbientStrength  = glGetUniformLocation(program, "ambientStrength");
+    uSpecularStrength = glGetUniformLocation(program, "specularStrength");
+    uShininess        = glGetUniformLocation(program, "shininess");
+
+    initLightingEffects(posLoc, norLoc);
 
     for (int i = 0; i < NUM_PLANETS; ++i)
         planets[i].texID = loadTex(planets[i].texPath, planets[i].color);
 
+    initSkybox();
     initTextRendering();
+    initFlightSpriteRendering();
 
     glEnable(GL_DEPTH_TEST);
     glClearColor(0.02f, 0.02f, 0.06f, 1.0f);
@@ -707,6 +1413,10 @@ static void display(GLFWwindow* window, float simDt, float realDt) {
     // Dispatch to gravity-sim render path when the user has toggled into it.
     if (sceneMode == SCENE_GRAVITY) {
         displayGravityScene(window, realDt);
+        return;
+    }
+    if (sceneMode == SCENE_EARTH) {
+        displayEarthScene(window, realDt);
         return;
     }
 
@@ -785,6 +1495,10 @@ static void display(GLFWwindow* window, float simDt, float realDt) {
     glActiveTexture(GL_TEXTURE0);
     glBindVertexArray(vao);
 
+    mat4 earthAtmosphereModel;
+    bool hasEarthAtmosphere = false;
+    turkeyMarkerVisible = false;
+
     for (int i = 0; i < NUM_PLANETS; ++i) {
         Planet& p = planets[i];
         // model: orbitTF * tilt * spin * scale  (so planet spins about its tilted axis)
@@ -796,12 +1510,31 @@ static void display(GLFWwindow* window, float simDt, float realDt) {
         glUniformMatrix4fv(uModel, 1, GL_TRUE, model);
         glUniform1i(uIsEmissive, p.isEmissive ? 1 : 0);
         glUniform1f(uHighlight, (i == selectedPlanet) ? 1.0f : 0.0f);
+        setPlanetMaterial(i);
         glBindTexture(GL_TEXTURE_2D, p.texID);
 
         glDrawElements(GL_TRIANGLES, sphereIndexCount, GL_UNSIGNED_INT, nullptr);
+
+        if (i == 3) {
+            float atmosphereScale = p.scale * 1.10f;
+            earthAtmosphereModel = orbitTF[i]
+                                 * RotateZ(p.axialTilt)
+                                 * RotateY(p.spinAngle)
+                                 * Scale(atmosphereScale, atmosphereScale, atmosphereScale);
+            hasEarthAtmosphere = true;
+        }
     }
 
-    // 7. Text overlay (HUD + selected-planet info + 2D selection marker)
+    drawTurkeyMarker(orbitTF[3], planets[3].spinAngle);
+
+    // 7. Draw the cubemap skybox behind all scene geometry.
+    drawSkybox(view, proj);
+
+    // 8. Additive light effects.
+    drawSunGlow(view, proj);
+    if (hasEarthAtmosphere) drawEarthAtmosphere(earthAtmosphereModel, view, proj);
+
+    // 9. Text overlay (HUD + selected-planet info + 2D selection marker)
     drawTextOverlay(window, view, proj);
 }
 
@@ -914,6 +1647,7 @@ static void drawSelectionMarker(GLFWwindow* window, const mat4& view, const mat4
     glUniform4f(uTextColor, 0.3f, 0.7f, 0.95f, 0.6f);
     glDrawArrays(GL_LINE_LOOP, 0, MARKER_SEGMENTS);
 }
+
 #endif
 
 static void drawTextOverlay(GLFWwindow* window, const mat4& view, const mat4& proj) {
@@ -935,6 +1669,10 @@ static void drawTextOverlay(GLFWwindow* window, const mat4& view, const mat4& pr
     // Draw the 2D selection ring first (uses the same text program & ortho).
     drawSelectionMarker(window, view, proj);
 
+    drawFlightSprite(window, ortho);
+
+    glUseProgram(textProgram);
+    glUniformMatrix4fv(uTextProj, 1, GL_TRUE, ortho);
     glBindVertexArray(textVAO);
 
     // -- HUD line (top-left)
@@ -948,19 +1686,31 @@ static void drawTextOverlay(GLFWwindow* window, const mat4& view, const mat4& pr
         drawTextString(12.0f, 16.0f, oss.str().c_str());
     }
 
+    if (mouseCaptured && focusedPlanet < 0 && sceneMode == SCENE_SOLAR && earthApproachAltitude < 3.0f) {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(2)
+            << "Earth approach   altitude " << earthApproachAltitude
+            << "   fly speed " << currentFlySpeed
+            << "   target Turkey";
+        glUniform4f(uTextColor, 1.0f, 0.86f, 0.35f, 1.0f);
+        drawTextString(12.0f, 44.0f, oss.str().c_str());
+    }
+
     // Layout uses 2x-scaled text, so account for that when spacing/anchoring.
     const float L = 16.0f;      // line height in source units (becomes ~32 px on screen)
     // PANEL_W is how many SCREEN pixels we reserve on the right for the info panel.
     // Text is rendered at TEXT_SCALE (2x), so this needs to cover the widest line × 2.
     const float PANEL_W = 760.0f;
 
-    // -- Controls hint (bottom-left, two lines)
+    // -- Controls hint (bottom-left)
     {
         glUniform4f(uTextColor, 0.65f, 0.7f, 0.8f, 1.0f);
-        drawTextString(12.0f, (float)wsH - 2.0f * L - 16.0f,
-            "1-9 select major bodies   0 clear   Left/Right prev/next body   F focus   G gravity   M mouse-look");
-        drawTextString(12.0f, (float)wsH - L - 12.0f,
-            "WASD fly (mouse-look only)   Space pause   Up/Down speed   R reset   ESC quit");
+        drawTextString(12.0f, (float)wsH - 3.0f * L - 16.0f,
+            "Press E for Earth travel mode   1-9 select planets   F focus   G gravity   M mouse-look");
+        drawTextString(12.0f, (float)wsH - 2.0f * L - 12.0f,
+            "WASD fly: auto-slow near Earth   0 clear   Left/Right prev/next body");
+        drawTextString(12.0f, (float)wsH - L - 8.0f,
+            "Space pause   Up/Down speed   R reset   ESC quit");
     }
 
     // -- Selected planet panel (top-right) — clamp to keep on narrow windows
@@ -1014,6 +1764,81 @@ static void drawTextOverlay(GLFWwindow* window, const mat4& view, const mat4& pr
     glEnable(GL_DEPTH_TEST);
     glBindVertexArray(0);
 #endif
+}
+
+static void drawEarthModeOverlay(GLFWwindow* window, const mat4& view, const mat4& proj) {
+#ifdef HAVE_STB_EASY_FONT
+    int wsW, wsH;
+    glfwGetWindowSize(window, &wsW, &wsH);
+    if (wsW <= 0 || wsH <= 0) return;
+
+    mat4 ortho = Ortho(0.0f, (float)wsW, (float)wsH, 0.0f, -1.0f, 1.0f);
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    glUseProgram(textProgram);
+    glUniformMatrix4fv(uTextProj, 1, GL_TRUE, ortho);
+    glBindVertexArray(textVAO);
+
+    std::ostringstream status;
+    status << std::fixed << std::setprecision(2)
+           << "EARTH TRAVEL MODE   altitude " << earthModeAltitude()
+           << "   fly speed " << currentFlySpeed
+           << "   target Turkey";
+    glUniform4f(uTextColor, 0.88f, 0.96f, 1.0f, 1.0f);
+    drawTextString(12.0f, 16.0f, status.str().c_str());
+
+    glUniform4f(uTextColor, 0.65f, 0.72f, 0.82f, 1.0f);
+    drawTextString(12.0f, (float)wsH - 2.0f * 16.0f - 16.0f,
+                   "WASD fly around Earth   Look down + W to descend   R reset above Turkey");
+    drawTextString(12.0f, (float)wsH - 16.0f - 12.0f,
+                   "E exit to solar system   M toggle mouse-look   ESC quit");
+
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glBindVertexArray(0);
+#endif
+}
+
+static void displayEarthScene(GLFWwindow* window, float realDt) {
+    (void)realDt;
+    glClearColor(0.015f, 0.018f, 0.035f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    mat4 view = LookAt(camPos, camPos + camFront, camUp);
+    mat4 proj = Perspective(55.0f, (float)winWidth / (float)winHeight, 0.05f, 200.0f);
+
+    drawSkybox(view, proj);
+
+    glUseProgram(program);
+    glUniformMatrix4fv(uView, 1, GL_TRUE, view);
+    glUniformMatrix4fv(uProj, 1, GL_TRUE, proj);
+    glUniform3f(uLightPos, 18.0f, 8.0f, 14.0f);
+    glUniform3f(uViewPos, camPos.x, camPos.y, camPos.z);
+    glUniform3f(uLightColor, 1.0f, 1.0f, 1.0f);
+    glUniform1i(uTex, 0);
+    glUniform1i(uUseSolidColor, 0);
+    glUniform1i(uIsEmissive, 0);
+    glUniform1f(uHighlight, 0.0f);
+    setPlanetMaterial(3);
+
+    mat4 earthModel = Scale(EARTH_MODE_RADIUS, EARTH_MODE_RADIUS, EARTH_MODE_RADIUS);
+    glUniformMatrix4fv(uModel, 1, GL_TRUE, earthModel);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, planets[3].texID);
+    glBindVertexArray(vao);
+    glDrawElements(GL_TRIANGLES, sphereIndexCount, GL_UNSIGNED_INT, nullptr);
+
+    turkeyMarkerVisible = false;
+    drawTurkeyMarkerAt(mat4(), EARTH_MODE_RADIUS, 0.08f);
+
+    mat4 atmosphereModel = Scale(EARTH_MODE_RADIUS * 1.035f,
+                                 EARTH_MODE_RADIUS * 1.035f,
+                                 EARTH_MODE_RADIUS * 1.035f);
+    drawEarthAtmosphere(atmosphereModel, view, proj);
+
+    drawEarthModeOverlay(window, view, proj);
 }
 
 // ── Gravity simulator scene ──────────────────────────────────────────────────
@@ -1260,7 +2085,8 @@ int main() {
     updateWindowTitle(window);
     std::cout << "Controls:\n"
               << "  M       toggle mouse capture (free-look)\n"
-              << "  WASD    fly camera\n"
+              << "  WASD    fly camera (auto-slows near Earth)\n"
+              << "  E       Earth travel mode\n"
               << "  Click   select planet (when mouse not captured)\n"
               << "  F       toggle focus camera on selected planet\n"
               << "  Space   pause / resume\n"
@@ -1290,14 +2116,45 @@ int main() {
 
         float dt = paused ? 0.0f : dtRaw * timeScale;
 
-        // Movement only in free-look mode AND when not focused AND in solar scene.
-        if (mouseCaptured && focusedPlanet < 0 && sceneMode == SCENE_SOLAR) {
+        if (mouseCaptured && focusedPlanet < 0 &&
+            (sceneMode == SCENE_SOLAR || sceneMode == SCENE_EARTH)) {
             vec3 right = normalize(cross(camFront, camUp));
-            float mv = camSpeed * dtRaw; // camera moves on real time, not sim time
-            if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) camPos = camPos + camFront * mv;
-            if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) camPos = camPos - camFront * mv;
-            if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) camPos = camPos - right    * mv;
-            if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) camPos = camPos + right    * mv;
+            vec3 inputDir(0.0f, 0.0f, 0.0f);
+            if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) inputDir = inputDir + camFront;
+            if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) inputDir = inputDir - camFront;
+            if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) inputDir = inputDir - right;
+            if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) inputDir = inputDir + right;
+
+            if (sceneMode == SCENE_EARTH) {
+                earthApproachAltitude = earthModeAltitude();
+                currentFlySpeed = earthModeFlySpeed(earthApproachAltitude);
+            } else {
+                currentFlySpeed = earthAwareFlySpeed();
+            }
+
+            float inputLenSq = dot(inputDir, inputDir);
+            if (inputLenSq > 0.0001f) {
+                inputDir = normalize(inputDir);
+                vec3 targetVelocity = inputDir * currentFlySpeed;
+                float accel = 1.0f - expf(-4.5f * dtRaw);
+                flyVelocity = flyVelocity + (targetVelocity - flyVelocity) * accel;
+            } else {
+                float drag = expf(-3.0f * dtRaw);
+                flyVelocity = flyVelocity * drag;
+            }
+
+            camPos = camPos + flyVelocity * dtRaw;
+            if (sceneMode == SCENE_EARTH) {
+                keepEarthModeCameraInFlightBand();
+            } else {
+                keepCameraAboveEarthSurface();
+            }
+            isFlying = dot(flyVelocity, flyVelocity) > 0.02f;
+        } else {
+            currentFlySpeed = 0.0f;
+            earthApproachAltitude = 999.0f;
+            flyVelocity = vec3(0.0f, 0.0f, 0.0f);
+            isFlying = false;
         }
 
         display(window, dt, dtRaw);
