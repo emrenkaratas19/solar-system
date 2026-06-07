@@ -70,7 +70,7 @@ static void buildSphere(int stacks, int sectors,
             verts.push_back(x); verts.push_back(y); verts.push_back(z);
             verts.push_back(x); verts.push_back(y); verts.push_back(z);
             verts.push_back((float)j / sectors);
-            verts.push_back((float)i / stacks);
+            verts.push_back(1.0f - (float)i / stacks);
         }
     }
 
@@ -481,7 +481,7 @@ static void setPlanetMaterial(int planetIndex) {
 
 static vec3 earthSurfaceDirection(float latitudeDeg, float longitudeDeg) {
     float lat = latitudeDeg * (float)M_PI / 180.0f;
-    float lon = longitudeDeg * (float)M_PI / 180.0f;
+    float lon = (longitudeDeg + 180.0f) * (float)M_PI / 180.0f;
     float cosLat = cosf(lat);
     return normalize(vec3(cosLat * cosf(lon), sinf(lat), cosLat * sinf(lon)));
 }
@@ -1819,7 +1819,7 @@ static void displayEarthScene(GLFWwindow* window, float realDt) {
     glUniform3f(uLightColor, 1.0f, 1.0f, 1.0f);
     glUniform1i(uTex, 0);
     glUniform1i(uUseSolidColor, 0);
-    glUniform1i(uIsEmissive, 0);
+    glUniform1i(uIsEmissive, 1);   // TEST: fully light the whole globe (flat texture, no day/night terminator)
     glUniform1f(uHighlight, 0.0f);
     setPlanetMaterial(3);
 
