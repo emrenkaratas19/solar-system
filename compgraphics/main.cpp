@@ -42,7 +42,12 @@ static void drawTextOverlay(GLFWwindow* window, const mat4& view, const mat4& pr
 static void drawSkybox(const mat4& view, const mat4& proj);
 static void drawFlightSprite(GLFWwindow* window, const mat4& ortho);
 static void drawSunGlow(const mat4& view, const mat4& proj);
-static void drawEarthAtmosphere(const mat4& earthModel, const mat4& view, const mat4& proj);
+static void drawWorldGlow(const vec3& center, float size, const vec3& color, float alpha,
+                          const mat4& view, const mat4& proj);
+static void drawEarthAtmosphere(const mat4& earthModel, const mat4& view, const mat4& proj,
+                                const vec3& color = vec3(0.30f, 0.70f, 1.0f),
+                                float strength = 0.36f,
+                                float fill = 0.0f);
 static void drawTurkeyMarker(const mat4& earthOrbitTF, float earthSpinAngle);
 static void enterEarthMode(GLFWwindow* window);
 static void displayEarthScene(GLFWwindow* window, float realDt);
@@ -302,6 +307,15 @@ struct Planet {
     vec3          worldPos;
 };
 
+struct ExplosionParticle {
+    vec3 pos;
+    vec3 vel;
+    vec3 color;
+    float age;
+    float life;
+    float size;
+};
+
 // Sun + 8 planets + key moons. parentIndex refers to position in this array.
 static const int NUM_PLANETS = 16;
 static Planet planets[NUM_PLANETS] = {
@@ -352,7 +366,7 @@ static GLint  uGlowView = -1, uGlowProj = -1, uGlowColor = -1, uGlowAlpha = -1;
 static GLuint atmosphereProgram = 0;
 static GLuint atmosphereVAO = 0;
 static GLint  uAtmModel = -1, uAtmView = -1, uAtmProj = -1, uAtmViewPos = -1;
-static GLint  uAtmColor = -1, uAtmStrength = -1;
+static GLint  uAtmColor = -1, uAtmStrength = -1, uAtmFill = -1;
 
 // text overlay GL objects
 static GLuint textProgram = 0;
@@ -364,6 +378,9 @@ static GLuint flightProgram = 0;
 static GLuint flightVAO = 0, flightVBO = 0;
 static GLuint flightTex = 0;
 static GLint  uFlightProj = -1, uFlightTex = -1, uFlightAlpha = -1;
+
+static GLuint earthNightTex = 0;
+static bool earthNightMode = false;
 
 // selection marker (2D ring drawn at the projected position of the selected body)
 static GLuint markerVAO = 0, markerVBO = 0;
@@ -401,6 +418,11 @@ static bool  mouseCaptured = false;
 static int   selectedPlanet = -1;   // -1 = none
 static int   focusedPlanet  = -1;   // -1 = free fly
 static float focusFollowDistance = 0.0f;
+
+// Solar-view destruction effect.
+static bool planetExploded[NUM_PLANETS] = { false };
+static float planetExplosionAge[NUM_PLANETS] = { 999.0f };
+static std::vector<ExplosionParticle> explosionParticles;
 
 // ── Scene mode (solar system vs gravity simulator) ───────────────────────────
 
@@ -469,6 +491,19 @@ static void updateAnglesFromCamFront() {
     camYaw   = atan2f(camFront.z, camFront.x) * 180.0f / (float)M_PI;
 }
 
+static float clamp01(float v) {
+    return std::max(0.0f, std::min(1.0f, v));
+}
+
+static float smooth01(float v) {
+    v = clamp01(v);
+    return v * v * (3.0f - 2.0f * v);
+}
+
+static float descendFade(float altitude, float fullAt, float hiddenAt) {
+    return smooth01((hiddenAt - altitude) / std::max(hiddenAt - fullAt, 0.0001f));
+}
+
 static void setPlanetMaterial(int planetIndex) {
     float ambient = 0.035f;
     float specular = 0.12f;
@@ -497,6 +532,10 @@ static vec3 earthSurfaceDirection(float latitudeDeg, float longitudeDeg) {
     float lon = (longitudeDeg + 180.0f) * (float)M_PI / 180.0f;
     float cosLat = cosf(lat);
     return normalize(vec3(cosLat * cosf(lon), sinf(lat), cosLat * sinf(lon)));
+}
+
+static vec3 earthVisualSurfaceDirection(float latitudeDeg, float longitudeDeg) {
+    return earthSurfaceDirection(latitudeDeg, -longitudeDeg);
 }
 
 static vec3 transformPoint(const mat4& m, const vec3& p) {
@@ -541,15 +580,104 @@ static float earthModeAltitude() {
 }
 
 static vec3 turkeySurfaceDirection() {
-    // Earth texture is sampled flipped on X, so the visual marker uses mirrored longitude.
-    return earthSurfaceDirection(39.0f, -35.0f);
+    // Earth texture is sampled flipped on X, so visual markers use mirrored longitude.
+    return earthVisualSurfaceDirection(39.0f, 35.0f);
 }
 
 static float earthModeFlySpeed(float altitude) {
-    float t = altitude / EARTH_MODE_MAX_ALTITUDE;
-    t = std::max(0.0f, std::min(1.0f, t));
-    float smooth = t * t * (3.0f - 2.0f * t);
-    return 0.12f + 1.85f * smooth;
+    float t = smooth01(altitude / EARTH_MODE_MAX_ALTITUDE);
+    return 0.08f + 1.45f * t;
+}
+
+static const char* earthModeLayerName(float altitude) {
+    if (altitude < 0.75f) return "landing";
+    if (altitude < 2.8f)  return "surface";
+    if (altitude < 5.6f)  return "cloud";
+    return "orbit";
+}
+
+static bool isPlanetHiddenByExplosion(int planetIndex) {
+    int idx = planetIndex;
+    while (idx >= 0 && idx < NUM_PLANETS) {
+        if (planetExploded[idx]) return true;
+        idx = planets[idx].parentIndex;
+    }
+    return false;
+}
+
+static vec3 explosionDirection(int i) {
+    float a = i * 2.3999632f;
+    float y = 1.0f - 2.0f * ((i + 0.5f) / 72.0f);
+    float r = sqrtf(std::max(0.0f, 1.0f - y * y));
+    return normalize(vec3(cosf(a) * r, y, sinf(a) * r));
+}
+
+static void triggerPlanetExplosion(int planetIndex) {
+    if (planetIndex <= 0 || planetIndex >= NUM_PLANETS) {
+        std::cout << "Select a non-Sun planet or moon first.\n";
+        return;
+    }
+    if (planetExploded[planetIndex]) {
+        std::cout << planets[planetIndex].name << " is already exploded.\n";
+        return;
+    }
+
+    Planet& p = planets[planetIndex];
+    planetExploded[planetIndex] = true;
+    planetExplosionAge[planetIndex] = 0.0f;
+    if (focusedPlanet == planetIndex || isPlanetHiddenByExplosion(focusedPlanet)) focusedPlanet = -1;
+
+    const int count = 72;
+    float baseSize = std::max(p.scale, 0.05f);
+    for (int i = 0; i < count; ++i) {
+        vec3 dir = explosionDirection(i);
+        float wave = sinf((float)i * 12.9898f) * 43758.5453f;
+        float rnd = wave - floorf(wave);
+        float speed = (0.45f + rnd * 1.25f) * (1.2f + baseSize * 2.1f);
+        ExplosionParticle e;
+        e.pos = p.worldPos + dir * baseSize * (0.65f + rnd * 0.55f);
+        e.vel = dir * speed + vec3(0.0f, 0.05f + rnd * 0.10f, 0.0f);
+        e.age = -rnd * 0.12f;
+        e.life = 1.8f + rnd * 1.4f;
+        e.size = baseSize * (0.10f + rnd * 0.18f);
+        if (i % 3 == 0) {
+            e.color = vec3(1.0f, 0.32f, 0.08f);
+        } else if (i % 3 == 1) {
+            e.color = vec3(1.0f, 0.74f, 0.20f);
+        } else {
+            e.color = vec3(0.55f, 0.46f, 0.38f);
+        }
+        explosionParticles.push_back(e);
+    }
+
+    selectedPlanet = -1;
+    std::cout << "Exploded " << p.name << "\n";
+}
+
+static void resetExplosions() {
+    for (int i = 0; i < NUM_PLANETS; ++i) {
+        planetExploded[i] = false;
+        planetExplosionAge[i] = 999.0f;
+    }
+    explosionParticles.clear();
+}
+
+static void updateExplosions(float realDt) {
+    float dt = std::max(0.0f, std::min(realDt, 0.05f));
+    for (int i = 0; i < NUM_PLANETS; ++i) {
+        if (planetExploded[i]) planetExplosionAge[i] += dt;
+    }
+    if (explosionParticles.empty()) return;
+    for (ExplosionParticle& e : explosionParticles) {
+        e.age += dt;
+        if (e.age <= 0.0f) continue;
+        e.pos = e.pos + e.vel * dt;
+        e.vel = e.vel * expf(-0.28f * dt);
+    }
+    explosionParticles.erase(
+        std::remove_if(explosionParticles.begin(), explosionParticles.end(),
+                       [](const ExplosionParticle& e) { return e.age > e.life; }),
+        explosionParticles.end());
 }
 
 static void keepEarthModeCameraInFlightBand() {
@@ -602,9 +730,10 @@ static void updateWindowTitle(GLFWwindow* window) {
             << "  drop = " << gravStartY << " m"
             << "  |  Space:drop  R:reset  Up/Down:height  G:exit  ESC:quit";
     } else if (sceneMode == SCENE_EARTH) {
-        oss << "Earth Travel Mode  |  WASD:fly  Mouse:look  R:reset above Turkey  E:exit  ESC:quit";
+        oss << "Earth Travel Mode  |  N:" << (earthNightMode ? "day" : "night")
+            << "  WASD:fly  Mouse:look  R:reset above Turkey  E:exit  ESC:quit";
     } else {
-        oss << "Solar System  |  E:Earth Mode  M:Mouse  WASD:Move  Click:Select  F:Focus  G:Gravity  Space:Pause  Up/Down:Speed  R:Reset  ESC:Quit  |  ";
+        oss << "Solar System  |  E:Earth Mode  X:Explode  M:Mouse  WASD:Move  Click:Select  F:Focus  G:Gravity  Space:Pause  Up/Down:Speed  R:Reset  ESC:Quit  |  ";
         if (paused) oss << "Paused";
         else        oss << "Speed " << timeScale << "x";
         if (selectedPlanet >= 0) oss << "  |  Selected: " << planets[selectedPlanet].name;
@@ -623,6 +752,8 @@ static void resetToDefaults(GLFWwindow* window) {
     updateCamFrontFromAngles();
     selectedPlanet = -1;
     focusedPlanet  = -1;
+    resetExplosions();
+    earthNightMode = false;
     flyVelocity = vec3(0.0f, 0.0f, 0.0f);
     isFlying = false;
     mouseCaptured = false;
@@ -661,6 +792,7 @@ static void pickPlanet(GLFWwindow* window, double mouseX, double mouseY) {
     int   bestIdx = -1;
     float bestT   = 1e30f;
     for (int i = 0; i < NUM_PLANETS; ++i) {
+        if (isPlanetHiddenByExplosion(i)) continue;
         vec3 oc = rayOrigin - planets[i].worldPos;
         float r = std::max(planets[i].scale * 1.6f, 0.08f);
         float b = dot(oc, rayDir);
@@ -683,6 +815,10 @@ static void pickPlanet(GLFWwindow* window, double mouseX, double mouseY) {
 // Select a body by index (with bounds check + console log).
 static void selectByIndex(int idx) {
     if (idx < 0 || idx >= NUM_PLANETS) return;
+    if (isPlanetHiddenByExplosion(idx)) {
+        std::cout << planets[idx].name << " is gone. Press R to reset.\n";
+        return;
+    }
     selectedPlanet = idx;
     std::cout << "Selected: " << planets[idx].name << " (#" << idx << ")\n";
 }
@@ -728,6 +864,10 @@ static void keyCallback(GLFWwindow* window, int key, int, int action, int) {
         if (action != GLFW_PRESS) return;
         if (key == GLFW_KEY_R) {
             enterEarthMode(window);
+        } else if (key == GLFW_KEY_N) {
+            earthNightMode = !earthNightMode;
+            updateWindowTitle(window);
+            std::cout << "Earth mode: " << (earthNightMode ? "night map\n" : "day map\n");
         } else if (key == GLFW_KEY_M) {
             mouseCaptured = !mouseCaptured;
             glfwSetInputMode(window, GLFW_CURSOR,
@@ -735,6 +875,16 @@ static void keyCallback(GLFWwindow* window, int key, int, int action, int) {
             firstMouse = true;
             flyVelocity = vec3(0.0f, 0.0f, 0.0f);
             isFlying = false;
+            updateWindowTitle(window);
+        }
+        return;
+    }
+
+    if (sceneMode == SCENE_SOLAR && key == GLFW_KEY_X && action == GLFW_PRESS) {
+        if (selectedPlanet < 0) {
+            std::cout << "Select a planet first, then press X to explode it.\n";
+        } else {
+            triggerPlanetExplosion(selectedPlanet);
             updateWindowTitle(window);
         }
         return;
@@ -1302,12 +1452,14 @@ static void initLightingEffects(GLuint spherePosLoc, GLuint sphereNorLoc) {
         "uniform vec3 viewPos;\n"
         "uniform vec3 atmosphereColor;\n"
         "uniform float atmosphereStrength;\n"
+        "uniform float atmosphereFill;\n"
         "out vec4 fragColor;\n"
         "void main() {\n"
         "    vec3 n = normalize(worldNormal);\n"
         "    vec3 v = normalize(viewPos - worldPos);\n"
         "    float rim = pow(1.0 - max(dot(n, v), 0.0), 2.1);\n"
-        "    float alpha = rim * atmosphereStrength;\n"
+        "    float fill = atmosphereFill * (0.28 + rim * 0.72);\n"
+        "    float alpha = rim * atmosphereStrength + fill;\n"
         "    fragColor = vec4(atmosphereColor * (0.55 + rim * 1.6), alpha);\n"
         "}\n";
 
@@ -1330,6 +1482,7 @@ static void initLightingEffects(GLuint spherePosLoc, GLuint sphereNorLoc) {
     uAtmViewPos  = glGetUniformLocation(atmosphereProgram, "viewPos");
     uAtmColor    = glGetUniformLocation(atmosphereProgram, "atmosphereColor");
     uAtmStrength = glGetUniformLocation(atmosphereProgram, "atmosphereStrength");
+    uAtmFill     = glGetUniformLocation(atmosphereProgram, "atmosphereFill");
 
     glGenVertexArrays(1, &atmosphereVAO);
     glBindVertexArray(atmosphereVAO);
@@ -1342,13 +1495,12 @@ static void initLightingEffects(GLuint spherePosLoc, GLuint sphereNorLoc) {
     glBindVertexArray(0);
 }
 
-static void drawSunGlow(const mat4& view, const mat4& proj) {
+static void drawWorldGlow(const vec3& center, float size, const vec3& color, float alpha,
+                          const mat4& view, const mat4& proj) {
     if (!glowProgram || !glowVAO) return;
 
-    vec3 center(0.0f, 0.0f, 0.0f);
     vec3 right = normalize(cross(camFront, camUp));
     vec3 up = normalize(cross(right, camFront));
-    float size = 5.4f;
     vec3 r = right * size;
     vec3 u = up * size;
 
@@ -1373,8 +1525,8 @@ static void drawSunGlow(const mat4& view, const mat4& proj) {
     glUseProgram(glowProgram);
     glUniformMatrix4fv(uGlowView, 1, GL_TRUE, view);
     glUniformMatrix4fv(uGlowProj, 1, GL_TRUE, proj);
-    glUniform3f(uGlowColor, 1.0f, 0.62f, 0.16f);
-    glUniform1f(uGlowAlpha, 0.70f);
+    glUniform3f(uGlowColor, color.x, color.y, color.z);
+    glUniform1f(uGlowAlpha, alpha);
 
     glBindVertexArray(glowVAO);
     glBindBuffer(GL_ARRAY_BUFFER, glowVBO);
@@ -1387,8 +1539,59 @@ static void drawSunGlow(const mat4& view, const mat4& proj) {
     glDisable(GL_BLEND);
 }
 
-static void drawEarthAtmosphere(const mat4& earthModel, const mat4& view, const mat4& proj) {
+static void drawSunGlow(const mat4& view, const mat4& proj) {
+    drawWorldGlow(vec3(0.0f, 0.0f, 0.0f), 5.4f, vec3(1.0f, 0.62f, 0.16f), 0.70f, view, proj);
+}
+
+static void drawExplosionEffects(const mat4& view, const mat4& proj) {
+    glUseProgram(program);
+    glUniformMatrix4fv(uView, 1, GL_TRUE, view);
+    glUniformMatrix4fv(uProj, 1, GL_TRUE, proj);
+    glUniform3f(uLightPos, 0.0f, 0.0f, 0.0f);
+    glUniform3f(uViewPos, camPos.x, camPos.y, camPos.z);
+    glUniform3f(uLightColor, 1.0f, 0.82f, 0.48f);
+    glUniform1i(uUseSolidColor, 1);
+    glUniform1i(uIsEmissive, 1);
+    glUniform1f(uHighlight, 0.0f);
+    glUniform1i(uFlipTexX, 0);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
+    glDepthMask(GL_FALSE);
+    glBindVertexArray(vao);
+
+    for (const ExplosionParticle& e : explosionParticles) {
+        if (e.age <= 0.0f || e.age >= e.life) continue;
+        float fade = 1.0f - e.age / e.life;
+        fade = fade * fade;
+        float pulse = 0.75f + 0.25f * sinf((e.age * 18.0f) + e.size * 80.0f);
+        float s = e.size * (0.35f + fade * 1.55f) * pulse;
+        vec3 color = e.color * fade;
+
+        mat4 model = Translate(e.pos.x, e.pos.y, e.pos.z) * Scale(s, s, s);
+        glUniform3f(uSolidColor, color.x, color.y, color.z);
+        glUniformMatrix4fv(uModel, 1, GL_TRUE, model);
+        glDrawElements(GL_TRIANGLES, sphereIndexCount, GL_UNSIGNED_INT, nullptr);
+    }
+
+    glDepthMask(GL_TRUE);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_BLEND);
+    glUniform1i(uUseSolidColor, 0);
+
+    for (int i = 1; i < NUM_PLANETS; ++i) {
+        if (!planetExploded[i]) continue;
+        float flash = 1.0f - planetExplosionAge[i] / 1.25f;
+        if (flash <= 0.0f) continue;
+        float size = std::max(planets[i].scale * (4.5f + planetExplosionAge[i] * 3.5f), 0.55f);
+        drawWorldGlow(planets[i].worldPos, size, vec3(1.0f, 0.36f, 0.08f), 0.85f * flash, view, proj);
+    }
+}
+
+static void drawEarthAtmosphere(const mat4& earthModel, const mat4& view, const mat4& proj,
+                                const vec3& color, float strength, float fill) {
     if (!atmosphereProgram || !atmosphereVAO) return;
+    if (strength <= 0.001f && fill <= 0.001f) return;
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE);
@@ -1399,8 +1602,9 @@ static void drawEarthAtmosphere(const mat4& earthModel, const mat4& view, const 
     glUniformMatrix4fv(uAtmView, 1, GL_TRUE, view);
     glUniformMatrix4fv(uAtmProj, 1, GL_TRUE, proj);
     glUniform3f(uAtmViewPos, camPos.x, camPos.y, camPos.z);
-    glUniform3f(uAtmColor, 0.30f, 0.70f, 1.0f);
-    glUniform1f(uAtmStrength, 0.36f);
+    glUniform3f(uAtmColor, color.x, color.y, color.z);
+    glUniform1f(uAtmStrength, strength);
+    glUniform1f(uAtmFill, fill);
 
     glBindVertexArray(atmosphereVAO);
     glDrawElements(GL_TRIANGLES, sphereIndexCount, GL_UNSIGNED_INT, nullptr);
@@ -1512,6 +1716,11 @@ static void init() {
     for (int i = 0; i < NUM_PLANETS; ++i)
         planets[i].texID = loadTex(planets[i].texPath, planets[i].color);
 
+    {
+        const unsigned char nightFallback[4] = { 8, 16, 32, 255 };
+        earthNightTex = loadTex("textures/earth_nightmap.jpg", nightFallback);
+    }
+
     // Tangerine ball texture for the gravity scene (shaded by Phong via planet shader).
     gravBallTex = makeSolidTex(220, 130, 50);
 
@@ -1551,6 +1760,7 @@ static void display(GLFWwindow* window, float simDt, float realDt) {
         if (planets[i].spinAngle  >  360.0f) planets[i].spinAngle  -= 360.0f;
         if (planets[i].spinAngle  < -360.0f) planets[i].spinAngle  += 360.0f;
     }
+    updateExplosions(realDt);
 
     // 2. Compute hierarchical orbit transforms (no spin/scale here).
     mat4 orbitTF[NUM_PLANETS];
@@ -1620,6 +1830,7 @@ static void display(GLFWwindow* window, float simDt, float realDt) {
 
     for (int i = 0; i < NUM_PLANETS; ++i) {
         Planet& p = planets[i];
+        if (isPlanetHiddenByExplosion(i)) continue;
         // model: orbitTF * tilt * spin * scale  (so planet spins about its tilted axis)
         mat4 model = orbitTF[i]
                    * RotateZ(p.axialTilt)
@@ -1645,13 +1856,16 @@ static void display(GLFWwindow* window, float simDt, float realDt) {
         }
     }
 
-    drawTurkeyMarker(orbitTF[3], planets[3].spinAngle);
+    if (!isPlanetHiddenByExplosion(3)) {
+        drawTurkeyMarker(orbitTF[3], planets[3].spinAngle);
+    }
 
     // 7. Draw the cubemap skybox behind all scene geometry.
     drawSkybox(view, proj);
 
     // 8. Additive light effects.
     drawSunGlow(view, proj);
+    drawExplosionEffects(view, proj);
     if (hasEarthAtmosphere) drawEarthAtmosphere(earthAtmosphereModel, view, proj);
 
     // 9. Text overlay (HUD + selected-planet info + 2D selection marker)
@@ -1768,6 +1982,144 @@ static void drawSelectionMarker(GLFWwindow* window, const mat4& view, const mat4
     glDrawArrays(GL_LINE_LOOP, 0, MARKER_SEGMENTS);
 }
 
+static void drawEarthHorizonHaze(int wsW, int wsH, float fade) {
+    fade = clamp01(fade);
+    if (fade <= 0.01f) return;
+
+    float y0 = (float)wsH * 0.54f;
+    float y1 = (float)wsH;
+    float verts[] = {
+        0.0f,       y0,
+        (float)wsW, y0,
+        0.0f,       y1,
+        (float)wsW, y1,
+    };
+
+    glBindVertexArray(markerVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, markerVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
+    glUniform4f(uTextColor, 0.42f, 0.72f, 1.0f, 0.10f * fade);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    float y2 = (float)wsH * 0.72f;
+    float verts2[] = {
+        0.0f,       y2,
+        (float)wsW, y2,
+        0.0f,       y1,
+        (float)wsW, y1,
+    };
+    glBufferData(GL_ARRAY_BUFFER, sizeof(verts2), verts2, GL_DYNAMIC_DRAW);
+    glUniform4f(uTextColor, 0.85f, 0.92f, 1.0f, 0.10f * fade);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+static void drawAtmosphericEntryOverlay(int wsW, int wsH, float altitude) {
+    float entry = descendFade(altitude, 0.45f, 6.2f);
+    if (entry <= 0.01f) return;
+
+    float topHaze = 0.12f * entry;
+    float lowerHaze = 0.18f * descendFade(altitude, 0.35f, 2.2f);
+    float top[] = {
+        0.0f,       0.0f,
+        (float)wsW, 0.0f,
+        0.0f,       (float)wsH * 0.28f,
+        (float)wsW, (float)wsH * 0.28f,
+    };
+    float bottom[] = {
+        0.0f,       (float)wsH * 0.62f,
+        (float)wsW, (float)wsH * 0.62f,
+        0.0f,       (float)wsH,
+        (float)wsW, (float)wsH,
+    };
+
+    glBindVertexArray(markerVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, markerVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(top), top, GL_DYNAMIC_DRAW);
+    glUniform4f(uTextColor, 0.20f, 0.58f, 1.0f, topHaze);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    glBufferData(GL_ARRAY_BUFFER, sizeof(bottom), bottom, GL_DYNAMIC_DRAW);
+    glUniform4f(uTextColor, 0.66f, 0.86f, 1.0f, lowerHaze);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    float speed = clamp01(length(flyVelocity) / 1.25f);
+    float streakAlpha = (0.18f + 0.35f * speed) * entry;
+    if (streakAlpha <= 0.02f) return;
+
+    std::vector<float> streaks;
+    const int count = 18;
+    streaks.reserve(count * 4);
+    float phase = fmodf((float)glfwGetTime() * (55.0f + speed * 70.0f), 90.0f);
+    for (int i = 0; i < count; ++i) {
+        float side = (i % 2 == 0) ? 1.0f : -1.0f;
+        float lane = (float)(i / 2) / (float)(count / 2 - 1);
+        float y = 70.0f + lane * ((float)wsH - 140.0f) + phase;
+        while (y > (float)wsH - 40.0f) y -= (float)wsH - 110.0f;
+        float edge = (side > 0.0f) ? (float)wsW - 28.0f : 28.0f;
+        float inner = (side > 0.0f) ? (float)wsW - 120.0f - 40.0f * speed
+                                    : 120.0f + 40.0f * speed;
+        streaks.push_back(edge);  streaks.push_back(y - 26.0f);
+        streaks.push_back(inner); streaks.push_back(y + 26.0f);
+    }
+    glBufferData(GL_ARRAY_BUFFER, streaks.size() * sizeof(float), streaks.data(), GL_DYNAMIC_DRAW);
+    glUniform4f(uTextColor, 0.72f, 0.92f, 1.0f, streakAlpha);
+    glDrawArrays(GL_LINES, 0, (int)(streaks.size() / 2));
+}
+
+static void drawEarthLandingRing(GLFWwindow* window, const mat4& view, const mat4& proj, float fade) {
+    fade = clamp01(fade);
+    if (fade <= 0.01f || !turkeyMarkerVisible) return;
+
+    vec4 wp = vec4(turkeyWorldPos.x, turkeyWorldPos.y, turkeyWorldPos.z, 1.0f);
+    vec4 clip = mulMV(proj, mulMV(view, wp));
+    if (clip.w <= 0.001f) return;
+
+    float nx = clip.x / clip.w;
+    float ny = clip.y / clip.w;
+    if (nx < -1.4f || nx > 1.4f || ny < -1.4f || ny > 1.4f) return;
+
+    int wsW, wsH;
+    glfwGetWindowSize(window, &wsW, &wsH);
+    if (wsW <= 0 || wsH <= 0) return;
+
+    float cx = (nx * 0.5f + 0.5f) * wsW;
+    float cy = (1.0f - (ny * 0.5f + 0.5f)) * wsH;
+    float pulse = 0.5f + 0.5f * sinf((float)glfwGetTime() * 3.2f);
+    float rPx = 34.0f + pulse * 12.0f + fade * 22.0f;
+
+    static std::vector<float> ringPx;
+    ringPx.resize(MARKER_SEGMENTS * 2);
+
+    glBindVertexArray(markerVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, markerVBO);
+
+    for (int pass = 0; pass < 4; ++pass) {
+        float r = rPx + pass * (12.0f + 2.0f * pulse);
+        for (int i = 0; i < MARKER_SEGMENTS; ++i) {
+            float t = i * 2.0f * (float)M_PI / MARKER_SEGMENTS;
+            ringPx[i*2+0] = cx + r * cosf(t);
+            ringPx[i*2+1] = cy + r * sinf(t);
+        }
+        glBufferData(GL_ARRAY_BUFFER, ringPx.size() * sizeof(float), ringPx.data(), GL_DYNAMIC_DRAW);
+        glUniform4f(uTextColor,
+                    pass < 2 ? 1.0f : 0.35f,
+                    pass < 2 ? 0.86f : 0.95f,
+                    pass < 2 ? 0.25f : 1.0f,
+                    (0.85f - pass * 0.13f) * fade);
+        glDrawArrays(GL_LINE_LOOP, 0, MARKER_SEGMENTS);
+    }
+
+    float cross[] = {
+        cx - rPx - 12.0f, cy, cx - rPx + 8.0f, cy,
+        cx + rPx - 8.0f,  cy, cx + rPx + 12.0f, cy,
+        cx, cy - rPx - 12.0f, cx, cy - rPx + 8.0f,
+        cx, cy + rPx - 8.0f,  cx, cy + rPx + 12.0f,
+    };
+    glBufferData(GL_ARRAY_BUFFER, sizeof(cross), cross, GL_DYNAMIC_DRAW);
+    glUniform4f(uTextColor, 1.0f, 0.92f, 0.45f, 0.75f * fade);
+    glDrawArrays(GL_LINES, 0, 8);
+}
+
 #endif
 
 static void drawTextOverlay(GLFWwindow* window, const mat4& view, const mat4& proj) {
@@ -1826,7 +2178,7 @@ static void drawTextOverlay(GLFWwindow* window, const mat4& view, const mat4& pr
     {
         glUniform4f(uTextColor, 0.65f, 0.7f, 0.8f, 1.0f);
         drawTextString(12.0f, (float)wsH - 3.0f * L - 16.0f,
-            "Press E for Earth travel mode   1-9 select planets   F focus   G gravity   M mouse-look");
+            "Press E for Earth travel mode   X explode selected   1-9 select planets   F focus   G gravity   M mouse-look");
         drawTextString(12.0f, (float)wsH - 2.0f * L - 12.0f,
             "WASD fly: auto-slow near Earth   0 clear   Left/Right prev/next body");
         drawTextString(12.0f, (float)wsH - L - 8.0f,
@@ -1899,19 +2251,29 @@ static void drawEarthModeOverlay(GLFWwindow* window, const mat4& view, const mat
 
     glUseProgram(textProgram);
     glUniformMatrix4fv(uTextProj, 1, GL_TRUE, ortho);
+
+    float altitude = earthModeAltitude();
+    float entryFactor = descendFade(altitude, 0.45f, 6.2f);
+    float landingFactor = descendFade(altitude, 0.45f, 3.6f);
+    drawAtmosphericEntryOverlay(wsW, wsH, altitude);
+    drawEarthHorizonHaze(wsW, wsH, entryFactor);
+    drawEarthLandingRing(window, view, proj, landingFactor);
+
     glBindVertexArray(textVAO);
 
     std::ostringstream status;
     status << std::fixed << std::setprecision(2)
-           << "EARTH TRAVEL MODE   altitude " << earthModeAltitude()
+           << "EARTH TRAVEL MODE   altitude " << altitude
            << "   fly speed " << currentFlySpeed
+           << "   layer " << earthModeLayerName(altitude)
+           << "   map " << (earthNightMode ? "night" : "day")
            << "   target Turkey";
     glUniform4f(uTextColor, 0.88f, 0.96f, 1.0f, 1.0f);
     drawTextString(12.0f, 16.0f, status.str().c_str());
 
     glUniform4f(uTextColor, 0.65f, 0.72f, 0.82f, 1.0f);
     drawTextString(12.0f, (float)wsH - 2.0f * 16.0f - 16.0f,
-                   "WASD fly around Earth   Look down + W to descend   R reset above Turkey");
+                   "WASD fly around Earth   Look down + W to descend   N day/night map   R reset above Turkey");
     drawTextString(12.0f, (float)wsH - 16.0f - 12.0f,
                    "E exit to solar system   M toggle mouse-look   ESC quit");
 
@@ -1925,6 +2287,11 @@ static void displayEarthScene(GLFWwindow* window, float realDt) {
     (void)realDt;
     glClearColor(0.015f, 0.018f, 0.035f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    float altitude = earthModeAltitude();
+    float orbitFactor = smooth01(altitude / 5.8f);
+    float cloudFactor = descendFade(altitude, 2.6f, 7.0f);
+    float landingFactor = descendFade(altitude, 0.45f, 3.6f);
 
     mat4 view = LookAt(camPos, camPos + camFront, camUp);
     mat4 proj = Perspective(55.0f, (float)winWidth / (float)winHeight, 0.05f, 200.0f);
@@ -1947,17 +2314,28 @@ static void displayEarthScene(GLFWwindow* window, float realDt) {
     mat4 earthModel = Scale(EARTH_MODE_RADIUS, EARTH_MODE_RADIUS, EARTH_MODE_RADIUS);
     glUniformMatrix4fv(uModel, 1, GL_TRUE, earthModel);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, planets[3].texID);
+    glBindTexture(GL_TEXTURE_2D, earthNightMode ? earthNightTex : planets[3].texID);
     glBindVertexArray(vao);
     glDrawElements(GL_TRIANGLES, sphereIndexCount, GL_UNSIGNED_INT, nullptr);
 
+    mat4 cloudModel = Scale(EARTH_MODE_RADIUS * 1.016f,
+                            EARTH_MODE_RADIUS * 1.016f,
+                            EARTH_MODE_RADIUS * 1.016f);
+    drawEarthAtmosphere(cloudModel, view, proj,
+                        vec3(0.80f, 0.92f, 1.0f),
+                        0.16f * cloudFactor,
+                        0.095f * cloudFactor);
+
     turkeyMarkerVisible = false;
-    drawTurkeyMarkerAt(mat4(), EARTH_MODE_RADIUS, 0.08f);
+    drawTurkeyMarkerAt(mat4(), EARTH_MODE_RADIUS, 0.10f + 0.055f * landingFactor);
 
     mat4 atmosphereModel = Scale(EARTH_MODE_RADIUS * 1.035f,
                                  EARTH_MODE_RADIUS * 1.035f,
                                  EARTH_MODE_RADIUS * 1.035f);
-    drawEarthAtmosphere(atmosphereModel, view, proj);
+    drawEarthAtmosphere(atmosphereModel, view, proj,
+                        vec3(0.30f, 0.70f, 1.0f),
+                        0.34f + 0.34f * orbitFactor,
+                        0.035f * cloudFactor + 0.060f * landingFactor);
 
     drawEarthModeOverlay(window, view, proj);
 }
@@ -2258,6 +2636,7 @@ int main() {
               << "  M       toggle mouse capture (free-look)\n"
               << "  WASD    fly camera (auto-slows near Earth)\n"
               << "  E       Earth travel mode\n"
+              << "  X       explode selected planet/moon (Sun excluded)\n"
               << "  Click   select planet (when mouse not captured)\n"
               << "  F       toggle focus camera on selected planet\n"
               << "  Space   pause / resume\n"
@@ -2307,10 +2686,20 @@ int main() {
             if (inputLenSq > 0.0001f) {
                 inputDir = normalize(inputDir);
                 vec3 targetVelocity = inputDir * currentFlySpeed;
-                float accel = 1.0f - expf(-4.5f * dtRaw);
+                float accelRate = 4.5f;
+                if (sceneMode == SCENE_EARTH) {
+                    float altitudeT = smooth01(earthApproachAltitude / EARTH_MODE_MAX_ALTITUDE);
+                    accelRate = 1.5f + 3.2f * altitudeT;
+                }
+                float accel = 1.0f - expf(-accelRate * dtRaw);
                 flyVelocity = flyVelocity + (targetVelocity - flyVelocity) * accel;
             } else {
-                float drag = expf(-3.0f * dtRaw);
+                float dragRate = 3.0f;
+                if (sceneMode == SCENE_EARTH) {
+                    float altitudeT = smooth01(earthApproachAltitude / EARTH_MODE_MAX_ALTITUDE);
+                    dragRate = 1.15f + 1.85f * altitudeT;
+                }
+                float drag = expf(-dragRate * dtRaw);
                 flyVelocity = flyVelocity * drag;
             }
 
