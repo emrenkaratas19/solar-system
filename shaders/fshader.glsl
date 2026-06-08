@@ -17,6 +17,7 @@ uniform bool  isEmissive;
 uniform float ambientStrength;
 uniform float specularStrength;
 uniform float shininess;
+uniform bool  flipTexX;
 
 uniform bool  useSolidColor;
 uniform vec3  solidColor;
@@ -33,7 +34,11 @@ void main()
         return;
     }
 
-    vec4 texSample = texture(uTex, fragTexCoord);
+    vec2 texCoord = fragTexCoord;
+    if (flipTexX) {
+        texCoord.x = 1.0 - texCoord.x;
+    }
+    vec4 texSample = texture(uTex, texCoord);
 
     if (isEmissive) {
         // Emissive bodies (the Sun) — still allow a highlight tint when picked.

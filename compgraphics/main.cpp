@@ -342,7 +342,7 @@ static GLint uLightPos, uViewPos, uLightColor;
 static GLint uIsEmissive, uTex;
 static GLint uUseSolidColor, uSolidColor;
 static GLint uHighlight;
-static GLint uAmbientStrength, uSpecularStrength, uShininess;
+static GLint uAmbientStrength, uSpecularStrength, uShininess, uFlipTexX;
 
 // additive visual effects
 static GLuint glowProgram = 0;
@@ -540,6 +540,11 @@ static float earthModeAltitude() {
     return std::max(0.0f, length(camPos) - EARTH_MODE_RADIUS);
 }
 
+static vec3 turkeySurfaceDirection() {
+    // Earth texture is sampled flipped on X, so the visual marker uses mirrored longitude.
+    return earthSurfaceDirection(39.0f, -35.0f);
+}
+
 static float earthModeFlySpeed(float altitude) {
     float t = altitude / EARTH_MODE_MAX_ALTITUDE;
     t = std::max(0.0f, std::min(1.0f, t));
@@ -550,7 +555,7 @@ static float earthModeFlySpeed(float altitude) {
 static void keepEarthModeCameraInFlightBand() {
     float distanceFromCenter = length(camPos);
     if (distanceFromCenter <= 0.0001f) {
-        camPos = earthSurfaceDirection(39.0f, 35.0f) * (EARTH_MODE_RADIUS + 2.0f);
+        camPos = turkeySurfaceDirection() * (EARTH_MODE_RADIUS + 2.0f);
         return;
     }
 
@@ -576,7 +581,7 @@ static void enterEarthMode(GLFWwindow* window) {
     flyVelocity = vec3(0.0f, 0.0f, 0.0f);
     isFlying = false;
 
-    vec3 turkeyDir = earthSurfaceDirection(39.0f, 35.0f);
+    vec3 turkeyDir = turkeySurfaceDirection();
     camPos = turkeyDir * (EARTH_MODE_RADIUS + 4.2f);
     camFront = normalize(-turkeyDir);
     updateAnglesFromCamFront();
@@ -1407,7 +1412,7 @@ static void drawEarthAtmosphere(const mat4& earthModel, const mat4& view, const 
 }
 
 static void drawTurkeyMarkerAt(const mat4& earthBaseTF, float earthRadius, float markerScale) {
-    vec3 turkeyDir = earthSurfaceDirection(39.0f, 35.0f);
+    vec3 turkeyDir = turkeySurfaceDirection();
 
     float surfaceRadius = earthRadius * 1.02f;
     turkeyWorldPos = transformPoint(earthBaseTF, turkeyDir * surfaceRadius);
@@ -1500,6 +1505,7 @@ static void init() {
     uAmbientStrength  = glGetUniformLocation(program, "ambientStrength");
     uSpecularStrength = glGetUniformLocation(program, "specularStrength");
     uShininess        = glGetUniformLocation(program, "shininess");
+    uFlipTexX         = glGetUniformLocation(program, "flipTexX");
 
     initLightingEffects(posLoc, norLoc);
 
@@ -1623,6 +1629,7 @@ static void display(GLFWwindow* window, float simDt, float realDt) {
         glUniformMatrix4fv(uModel, 1, GL_TRUE, model);
         glUniform1i(uIsEmissive, p.isEmissive ? 1 : 0);
         glUniform1f(uHighlight, (i == selectedPlanet) ? 1.0f : 0.0f);
+        glUniform1i(uFlipTexX, (i == 3) ? 1 : 0);
         setPlanetMaterial(i);
         glBindTexture(GL_TEXTURE_2D, p.texID);
 
@@ -1934,6 +1941,7 @@ static void displayEarthScene(GLFWwindow* window, float realDt) {
     glUniform1i(uUseSolidColor, 0);
     glUniform1i(uIsEmissive, 1);   // TEST: fully light the whole globe (flat texture, no day/night terminator)
     glUniform1f(uHighlight, 0.0f);
+    glUniform1i(uFlipTexX, 1);
     setPlanetMaterial(3);
 
     mat4 earthModel = Scale(EARTH_MODE_RADIUS, EARTH_MODE_RADIUS, EARTH_MODE_RADIUS);
@@ -2111,6 +2119,7 @@ static void displayGravityScene(GLFWwindow* window, float realDt) {
         glUniform1i(uIsEmissive,    0);
         glUniform1i(uUseSolidColor, 0);
         glUniform1f(uHighlight,     0.0f);
+        glUniform1i(uFlipTexX,      0);
         glUniform1i(uTex, 0);
         // The newer shader uses these extra Phong knobs — set sensible defaults.
         if (uAmbientStrength  >= 0) glUniform1f(uAmbientStrength,  0.15f);
