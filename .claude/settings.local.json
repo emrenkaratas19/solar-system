@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xcodebuild -project compgraphics.xcodeproj -scheme compgraphics -configuration Debug build)",
+      "Bash(/Users/omercelik/Library/Developer/Xcode/DerivedData/compgraphics-axinlumsixpwvwbwvfafjaoesjvz/Build/Products/Debug/compgraphics)",
+      "Bash(echo \"pid=$!\")",
+      "Read(//tmp/**)",
+      "Bash(osascript -e 'tell application \"System Events\" to keystroke \"e\"')",
+      "Bash(osascript -e 'tell application \"System Events\" to get id of first window of \\(first process whose name contains \"compgraphics\"\\)')",
+      "Bash(screencapture -o -x /tmp/earthmode.png)",
+      "Bash(kill 10647)",
+      "Bash(grep -n 'program = glCreateProgram\\\\|const char\\\\* .*=\\\\s*$\\\\|\"#version' compgraphics/main.cpp)"
+    ]
+  }
+}
