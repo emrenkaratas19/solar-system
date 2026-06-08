@@ -20,3 +20,7 @@ project.xcworkspace/xcuserdata/
 *.o
 *.out
 *.dSYM/
+.claude/
+*.xcuserstate
+xcuserdata/
+.DS_Store

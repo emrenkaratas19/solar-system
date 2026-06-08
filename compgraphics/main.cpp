@@ -47,6 +47,7 @@ static void drawTurkeyMarker(const mat4& earthOrbitTF, float earthSpinAngle);
 static void enterEarthMode(GLFWwindow* window);
 static void displayEarthScene(GLFWwindow* window, float realDt);
 static void displayGravityScene(GLFWwindow* window, float realDt);
+static const char* massComparison(float m);
 
 // ── Sphere geometry ──────────────────────────────────────────────────────────
 
@@ -422,6 +423,18 @@ static bool        gravFalling    = false;
 static float       gravElapsed    = 0.0f;    // seconds since drop started
 static float       gravPeakV      = 0.0f;    // max velocity attained
 static bool        gravLanded     = false;
+static float       gravMass       = 1.0f;    // object mass in kg (visualized as ball size)
+static int         gravPlanetIdx  = 3;       // snapshotted on G-press for background tinting
+static float       gravTimeScale  = 2.0f;    // sim time multiplier (1x = exact real physics)
+
+// Background gradient for the gravity scene (one shader + a fullscreen quad).
+static GLuint bgProgram = 0;
+static GLuint bgVAO = 0, bgVBO = 0;
+static GLint  uBgTop = -1, uBgBottom = -1;
+
+// Solid-color 1x1 texture so we can shade the gravity ball with the existing
+// Phong shader without needing a real bitmap.
+static GLuint gravBallTex = 0;
 
 // ── Timing / simulation ──────────────────────────────────────────────────────
 
@@ -685,7 +698,8 @@ static void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
         glfwSetWindowShouldClose(window, GLFW_TRUE);
 
-    if (key == GLFW_KEY_E && action == GLFW_PRESS) {
+    // E toggles Earth-travel mode — but only outside gravity sim (gravity uses E for "heavier mass")
+    if (key == GLFW_KEY_E && action == GLFW_PRESS && sceneMode != SCENE_GRAVITY) {
         if (sceneMode == SCENE_EARTH) {
             sceneMode = SCENE_SOLAR;
             camPos = defaultCamPos;
@@ -731,6 +745,7 @@ static void keyCallback(GLFWwindow* window, int key, int, int action, int) {
                 std::cout << "(Gravity) Press 1-9 to select a planet first.\n";
             } else {
                 sceneMode      = SCENE_GRAVITY;
+                gravPlanetIdx  = selectedPlanet;
                 gravG          = planets[selectedPlanet].gravityMS2;
                 gravPlanetName = planets[selectedPlanet].name;
                 resetGravityObject();
@@ -762,6 +777,22 @@ static void keyCallback(GLFWwindow* window, int key, int, int action, int) {
             if (gravStartY < 10.0f) gravStartY = 10.0f;
             resetGravityObject();
             std::cout << "Drop height: " << gravStartY << " m\n";
+        } else if (key == GLFW_KEY_E) {              // heavier (x2)
+            gravMass *= 2.0f;
+            if (gravMass > 10000.0f) gravMass = 10000.0f;
+            std::cout << "Mass: " << gravMass << " kg " << massComparison(gravMass) << "\n";
+        } else if (key == GLFW_KEY_Q) {              // lighter (/2)
+            gravMass *= 0.5f;
+            if (gravMass < 0.001f) gravMass = 0.001f;
+            std::cout << "Mass: " << gravMass << " kg " << massComparison(gravMass) << "\n";
+        } else if (key == GLFW_KEY_PERIOD) {         // faster sim
+            gravTimeScale *= 1.5f;
+            if (gravTimeScale > 16.0f) gravTimeScale = 16.0f;
+            std::cout << "Sim speed: " << gravTimeScale << "x\n";
+        } else if (key == GLFW_KEY_COMMA) {          // slower sim
+            gravTimeScale /= 1.5f;
+            if (gravTimeScale < 0.1f) gravTimeScale = 0.1f;
+            std::cout << "Sim speed: " << gravTimeScale << "x\n";
         }
         return;
     }
@@ -885,6 +916,84 @@ static void framebufferSizeCallback(GLFWwindow*, int width, int height) {
 }
 
 // ── Initialisation ───────────────────────────────────────────────────────────
+
+// Tiny 1x1 solid-color texture — used to give the gravity ball a flat hue
+// while still routing through the Phong-lit planet shader for shading.
+static GLuint makeSolidTex(unsigned char r, unsigned char g, unsigned char b) {
+    unsigned char rgba[4] = { r, g, b, 255 };
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    return tex;
+}
+
+// Human-relatable comparison for the mass value (shown next to the kg number).
+static const char* massComparison(float m) {
+    if (m < 0.01f)    return "(lighter than a paperclip)";
+    if (m < 0.1f)     return "(about a tennis ball)";
+    if (m < 1.0f)     return "(about an apple)";
+    if (m < 10.0f)    return "(about a brick)";
+    if (m < 100.0f)   return "(about a person)";
+    if (m < 1000.0f)  return "(about a car)";
+    if (m < 10000.0f) return "(about an elephant)";
+    return "(heavier than a truck)";
+}
+
+// Background gradient shader for the gravity scene.
+static void initBackgroundShader() {
+    const char* vs =
+        "#version 150\n"
+        "in vec2 inPos;\n"
+        "out vec2 vUv;\n"
+        "void main() {\n"
+        "    vUv = inPos * 0.5 + 0.5;\n"
+        "    gl_Position = vec4(inPos, 0.0, 1.0);\n"
+        "}\n";
+    const char* fs =
+        "#version 150\n"
+        "in vec2 vUv;\n"
+        "uniform vec3 topColor;\n"
+        "uniform vec3 bottomColor;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    float t = 1.0 - vUv.y;\n"          // vUv.y=1 is TOP in NDC -> we want dark at top
+        "    vec3 c = mix(topColor, bottomColor, t);\n"
+        "    fragColor = vec4(c, 1.0);\n"
+        "}\n";
+
+    GLuint v = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(v, 1, &vs, nullptr); glCompileShader(v);
+    GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(f, 1, &fs, nullptr); glCompileShader(f);
+    bgProgram = glCreateProgram();
+    glAttachShader(bgProgram, v);
+    glAttachShader(bgProgram, f);
+    glBindAttribLocation(bgProgram, 0, "inPos");
+    glLinkProgram(bgProgram);
+    glDeleteShader(v); glDeleteShader(f);
+    uBgTop    = glGetUniformLocation(bgProgram, "topColor");
+    uBgBottom = glGetUniformLocation(bgProgram, "bottomColor");
+
+    float quad[] = {
+        -1.0f, -1.0f,
+         1.0f, -1.0f,
+        -1.0f,  1.0f,
+         1.0f,  1.0f,
+    };
+    glGenVertexArrays(1, &bgVAO);
+    glBindVertexArray(bgVAO);
+    glGenBuffers(1, &bgVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, bgVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    glBindVertexArray(0);
+}
 
 static void initTextRendering() {
     // Vertex shader: takes 2D pixel-space position, projects with ortho.
@@ -1397,7 +1506,11 @@ static void init() {
     for (int i = 0; i < NUM_PLANETS; ++i)
         planets[i].texID = loadTex(planets[i].texPath, planets[i].color);
 
+    // Tangerine ball texture for the gravity scene (shaded by Phong via planet shader).
+    gravBallTex = makeSolidTex(220, 130, 50);
+
     initSkybox();
+    initBackgroundShader();
     initTextRendering();
     initFlightSpriteRendering();
 
@@ -1845,10 +1958,13 @@ static void displayEarthScene(GLFWwindow* window, float realDt) {
 
 static void displayGravityScene(GLFWwindow* window, float realDt) {
     // 1. Update physics (semi-implicit Euler — energy-stable enough for this).
+    // We tick simulated time at gravTimeScale x real time so falls feel punchier
+    // on screen; displayed quantities are still real-world physical values.
     if (gravFalling && !gravLanded) {
-        gravObjVy   += gravG * realDt;
-        gravObjY    -= gravObjVy * realDt;
-        gravElapsed += realDt;
+        float dt = realDt * gravTimeScale;
+        gravObjVy   += gravG * dt;
+        gravObjY    -= gravObjVy * dt;
+        gravElapsed += dt;
         if (gravObjVy > gravPeakV) gravPeakV = gravObjVy;
         if (gravObjY <= 0.0f) {
             gravObjY    = 0.0f;
@@ -1857,15 +1973,32 @@ static void displayGravityScene(GLFWwindow* window, float realDt) {
         }
     }
 
-    // 2. Set up 2D rendering.
-    glClearColor(0.04f, 0.05f, 0.10f, 1.0f);
+    // 2. Set up rendering.
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     int wsW, wsH;
     glfwGetWindowSize(window, &wsW, &wsH);
     if (wsW <= 0 || wsH <= 0) return;
 
-    glDisable(GL_DEPTH_TEST);
+    // 2a. Planet-themed gradient background — dark space top, planet hue at horizon.
+    {
+        float tr = 0.02f, tg = 0.03f, tb = 0.10f;   // top: deep space
+        float br = 0.15f, bg = 0.17f, bb = 0.24f;
+        if (gravPlanetIdx >= 0 && gravPlanetIdx < NUM_PLANETS) {
+            br = (planets[gravPlanetIdx].color[0] / 255.0f) * 0.45f + 0.03f;
+            bg = (planets[gravPlanetIdx].color[1] / 255.0f) * 0.45f + 0.03f;
+            bb = (planets[gravPlanetIdx].color[2] / 255.0f) * 0.45f + 0.03f;
+        }
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+        glUseProgram(bgProgram);
+        glBindVertexArray(bgVAO);
+        glUniform3f(uBgTop,    tr, tg, tb);
+        glUniform3f(uBgBottom, br, bg, bb);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+
+    // 2b. Switch to text program for 2D markers + text.
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
@@ -1881,7 +2014,10 @@ static void displayGravityScene(GLFWwindow* window, float realDt) {
     // metres-per-pixel scale: drop height fills most of the usable area
     float pxPerMetre = usableH / std::max(gravStartY * 1.05f, 1.0f);
     float cx         = (float)wsW * 0.5f;
-    float ballR      = 22.0f;
+    // Ball radius scales logarithmically with mass so values across many decades
+    // are still visible (0.001 kg ~ 11 px, 1 kg ~ 30 px, 1000 kg ~ 85 px).
+    float ballR      = 30.0f * powf(std::max(gravMass, 0.001f), 0.15f);
+    ballR            = std::max(10.0f, std::min(ballR, 150.0f));
     float ballY      = groundY - gravObjY * pxPerMetre;
 
     glBindVertexArray(markerVAO);
@@ -1951,32 +2087,48 @@ static void displayGravityScene(GLFWwindow* window, float realDt) {
         lastSampleT = -1.0f;
     }
 
-    // 3e. Falling object (filled disc + outline).
-    const int CIRC_SEGS = 36;
+    // 3e. Falling object — render the existing 3D sphere mesh with Phong shading,
+    // using an orthographic projection in window-pixel space so it sits exactly
+    // at (cx, ballY) with screen radius ballR. Visibly scales with mass.
     {
-        std::vector<float> disc;
-        disc.reserve((CIRC_SEGS + 2) * 2);
-        disc.push_back(cx); disc.push_back(ballY);
-        for (int i = 0; i <= CIRC_SEGS; ++i) {
-            float t = i * 2.0f * (float)M_PI / CIRC_SEGS;
-            disc.push_back(cx + ballR * cosf(t));
-            disc.push_back(ballY + ballR * sinf(t));
-        }
-        glUniform4f(uTextColor, 0.85f, 0.55f, 0.30f, 1.0f);
-        glBufferData(GL_ARRAY_BUFFER, disc.size() * sizeof(float), disc.data(), GL_DYNAMIC_DRAW);
-        glDrawArrays(GL_TRIANGLE_FAN, 0, CIRC_SEGS + 2);
-    }
-    {
-        std::vector<float> ring;
-        ring.reserve(CIRC_SEGS * 2);
-        for (int i = 0; i < CIRC_SEGS; ++i) {
-            float t = i * 2.0f * (float)M_PI / CIRC_SEGS;
-            ring.push_back(cx + ballR * cosf(t));
-            ring.push_back(ballY + ballR * sinf(t));
-        }
-        glUniform4f(uTextColor, 1.0f, 0.85f, 0.55f, 1.0f);
-        glBufferData(GL_ARRAY_BUFFER, ring.size() * sizeof(float), ring.data(), GL_DYNAMIC_DRAW);
-        glDrawArrays(GL_LINE_LOOP, 0, CIRC_SEGS);
+        glClear(GL_DEPTH_BUFFER_BIT);     // fresh depth buffer for the 3D pass
+        glEnable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+
+        glUseProgram(program);
+        mat4 ballProj  = Ortho(0.0f, (float)wsW, (float)wsH, 0.0f, -1000.0f, 1000.0f);
+        mat4 ballView  = mat4();
+        mat4 ballModel = Translate(cx, ballY, 0.0f)
+                       * Scale(ballR, ballR, ballR);
+
+        glUniformMatrix4fv(uView,  1, GL_TRUE, ballView);
+        glUniformMatrix4fv(uProj,  1, GL_TRUE, ballProj);
+        glUniformMatrix4fv(uModel, 1, GL_TRUE, ballModel);
+        // Sun-like light from upper-left; viewer "in front" of screen.
+        glUniform3f(uLightPos,   cx - 350.0f, ballY - 350.0f, 350.0f);
+        glUniform3f(uViewPos,    cx, ballY, 500.0f);
+        glUniform3f(uLightColor, 1.0f, 0.97f, 0.92f);
+        glUniform1i(uIsEmissive,    0);
+        glUniform1i(uUseSolidColor, 0);
+        glUniform1f(uHighlight,     0.0f);
+        glUniform1i(uTex, 0);
+        // The newer shader uses these extra Phong knobs — set sensible defaults.
+        if (uAmbientStrength  >= 0) glUniform1f(uAmbientStrength,  0.15f);
+        if (uSpecularStrength >= 0) glUniform1f(uSpecularStrength, 0.6f);
+        if (uShininess        >= 0) glUniform1f(uShininess,        24.0f);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, gravBallTex);
+
+        glBindVertexArray(vao);   // shared planet sphere VAO
+        glDrawElements(GL_TRIANGLES, sphereIndexCount, GL_UNSIGNED_INT, nullptr);
+
+        glDisable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+
+        // Restore text-program state for the upcoming text overlays.
+        glUseProgram(textProgram);
+        glUniformMatrix4fv(uTextProj, 1, GL_TRUE, ortho);
     }
 
 #ifdef HAVE_STB_EASY_FONT
@@ -1986,8 +2138,8 @@ static void displayGravityScene(GLFWwindow* window, float realDt) {
     // Title (top-left)
     {
         char buf[128];
-        snprintf(buf, sizeof(buf), "GRAVITY DEMO  ::  %s   g = %.2f m/s^2",
-                 gravPlanetName, gravG);
+        snprintf(buf, sizeof(buf), "GRAVITY DEMO  ::  %s   g = %.2f m/s^2   sim speed %.2fx",
+                 gravPlanetName, gravG, gravTimeScale);
         glUniform4f(uTextColor, 1.0f, 0.95f, 0.7f, 1.0f);
         drawTextString(40.0f, 24.0f, buf);
     }
@@ -2005,15 +2157,25 @@ static void displayGravityScene(GLFWwindow* window, float realDt) {
         drawTextString(xR, 24.0f, buf);
     }
 
-    // Live stats (above the ground)
+    // Live stats — two rows: motion on top, mass-derived below.
     {
-        char buf[128];
+        char buf[200];
         snprintf(buf, sizeof(buf),
                  "Height %5.1f m   Velocity %5.1f m/s   Time %5.2f s   Peak v %5.1f m/s",
                  gravObjY, gravObjVy, gravElapsed, gravPeakV);
         glUniform4f(uTextColor, 0.9f, 0.9f, 0.95f, 1.0f);
+        drawTextString(40.0f, groundY - 44.0f, buf);
+
+        float weightN = gravMass * gravG;
+        float keJ     = 0.5f * gravMass * gravObjVy * gravObjVy;
+        float momKgMS = gravMass * gravObjVy;
+        snprintf(buf, sizeof(buf),
+                 "Mass %.3g kg %s   Weight %.2f N   KE %.1f J   Momentum %.1f kg.m/s",
+                 gravMass, massComparison(gravMass), weightN, keJ, momKgMS);
+        glUniform4f(uTextColor, 0.95f, 0.85f, 0.55f, 1.0f);
         drawTextString(40.0f, groundY - 24.0f, buf);
     }
+
 
     // Status pill (just under title)
     {
@@ -2030,9 +2192,9 @@ static void displayGravityScene(GLFWwindow* window, float realDt) {
     {
         glUniform4f(uTextColor, 0.6f, 0.65f, 0.75f, 1.0f);
         drawTextString(40.0f, (float)wsH - 50.0f,
-            "Space  drop / pause     R  reset     Up / Down  change drop height");
+            "Space drop/pause   R reset   Up/Down drop height   Q/E mass /2 or x2   ,/. sim speed");
         drawTextString(40.0f, (float)wsH - 28.0f,
-            "G  exit gravity mode     ESC  quit");
+            "G exit gravity mode   ESC quit");
     }
 #endif
 
