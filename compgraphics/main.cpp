@@ -1261,7 +1261,7 @@ static void initFlightSpriteRendering() {
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
 
     const unsigned char fallback[] = { 80, 120, 255, 255 };
-    flightTex = loadTex("textures/flying_sprite.png", fallback);
+    flightTex = loadTex("textures/superman_back_cutout.png", fallback);
 
     glBindVertexArray(0);
 }
